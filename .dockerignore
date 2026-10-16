@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+.env
+.git
+.gitignore
+uploads/*
+!uploads/.gitkeep
+local_documents.json
+local_users.json

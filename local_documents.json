@@ -1,0 +1,42 @@
+[
+  {
+    "id": 4,
+    "original_name": "My_Secret_Note.txt",
+    "mime_type": "text/plain; charset=utf-8",
+    "storage_key": "77b69673f45b99645aafb15cf1420eea16cc37fd.txt",
+    "access_code_hash": "68fdf3386390f7db022407810721e0898fad9d26e3444ea34a5360faccb8b697",
+    "file_size": 38,
+    "expires_at": "2026-10-10T17:04:35.325Z",
+    "created_at": "2026-10-10T16:04:35.330Z"
+  },
+  {
+    "id": 3,
+    "original_name": "ALM3.pdf",
+    "mime_type": "application/pdf",
+    "storage_key": "af66e890a2578f4f9c99990b02b4729daa078332.pdf",
+    "access_code_hash": "32080c0d23e8e7a32a479e7f0529356670c87b1187bfa039dfe19205c3a56907",
+    "file_size": 193731,
+    "expires_at": "2026-10-11T06:46:38.872Z",
+    "created_at": "2026-10-10T06:46:38.874Z"
+  },
+  {
+    "id": 2,
+    "original_name": "talent decrypt.pdf",
+    "mime_type": "application/pdf",
+    "storage_key": "91061d92cd6ecb8be0bb611a99b4e34b6edc50d9.pdf",
+    "access_code_hash": "79a9fb0dd7253687159e621aa341cc661fe25c9123811f8cf2c293f92f390134",
+    "file_size": 127252,
+    "expires_at": "2026-10-11T06:07:50.623Z",
+    "created_at": "2026-10-10T06:07:50.624Z"
+  },
+  {
+    "id": 1,
+    "original_name": "Quarterly_Report_2026.txt",
+    "mime_type": "text/plain",
+    "storage_key": "9006fc7d714e1adbef0b937a664f3678b43937c8.txt",
+    "access_code_hash": "c8930f0244d9e8c905011460c0fc58aa707441a585e0215f3218ea27ebaabad2",
+    "file_size": 46,
+    "expires_at": "2026-10-11T06:04:48.621Z",
+    "created_at": "2026-10-10T06:04:48.623Z"
+  }
+]
