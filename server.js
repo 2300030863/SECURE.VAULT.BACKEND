@@ -453,6 +453,7 @@ app.post("/api/documents/upload", uploadLimiter, requireAuth, handleUploadOrText
 
     let archiveName = "";
     let fileCount = 0;
+    const customName = (req.body.name || req.body.title || req.body.document_name || "").trim();
 
     if (files.length > 0) {
       fileCount = files.length;
@@ -462,7 +463,10 @@ app.post("/api/documents/upload", uploadLimiter, requireAuth, handleUploadOrText
         });
       });
 
-      if (files.length === 1) {
+      if (customName) {
+        const cleanBase = path.basename(customName, path.extname(customName)).replace(/[/\\?%*:|"<>]/g, "_");
+        archiveName = `${cleanBase || "archive"}.zip`;
+      } else if (files.length === 1) {
         const base = path.basename(files[0].originalname, path.extname(files[0].originalname));
         archiveName = `${base}.zip`;
       } else {
@@ -471,7 +475,7 @@ app.post("/api/documents/upload", uploadLimiter, requireAuth, handleUploadOrText
       }
     } else if (hasText) {
       fileCount = 1;
-      let title = (req.body.title || "").trim();
+      let title = customName || (req.body.title || "").trim();
       if (!title) {
         title = "Secure_Note.txt";
       } else if (!path.extname(title)) {
@@ -855,7 +859,7 @@ function renderArchiveViewerHtml(doc, entries, codeParam) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${escapeHtml(doc.original_name)} — SECURE VAULT</title>
+  <title>${escapeHtml(doc.original_name)} — DocQevrilo</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -1051,7 +1055,7 @@ function renderArchiveViewerHtml(doc, entries, codeParam) {
           <p>${entries.length} ${entries.length === 1 ? 'file' : 'files'} in archive · Secure Stream</p>
         </div>
       </div>
-      <span class="badge">SECURE VAULT</span>
+      <span class="badge">DocQevrilo</span>
     </div>
 
     <div>
@@ -1560,7 +1564,7 @@ app.put("/api/documents/:id", requireAuth, async (req, res) => {
       return res.status(403).json({ error: "You do not have permission to edit this document." });
     }
 
-    const { name, title, expiry, text } = req.body;
+    const { name, title, expiry, text, storage_mode, max_downloads, delete_after_download } = req.body;
     let newName = (name || title || "").trim();
     if (newName) {
       const originalExt = path.extname(doc.original_name);
@@ -1604,6 +1608,9 @@ app.put("/api/documents/:id", requireAuth, async (req, res) => {
       original_name: newName,
       expires_at: newExpiresAt,
       file_size: newFileSize,
+      storage_mode: storage_mode,
+      max_downloads: max_downloads,
+      delete_after_download: delete_after_download,
     });
 
     res.json({

@@ -49,13 +49,13 @@ async function sendResetEmail(email, resetUrl, otpCode = "") {
   const sender = process.env.GMAIL_USER.trim();
 
   await transporter.sendMail({
-    from: `"Secure Vault" <${sender}>`,
+    from: `"DocQevrilo" <${sender}>`,
     to: email,
     subject: otpCode
-      ? `Your Secure Vault Password Reset Code: ${otpCode}`
-      : "Reset your Secure Vault password",
+      ? `Your DocQevrilo Password Reset Code: ${otpCode}`
+      : "Reset your DocQevrilo password",
     text: [
-      "We received a request to reset your Secure Vault password.",
+      "We received a request to reset your DocQevrilo password.",
       "",
       otpCode ? `Your 6-Digit OTP Verification Code is: ${otpCode}` : "",
       "",
@@ -74,15 +74,15 @@ async function sendResetEmail(email, resetUrl, otpCode = "") {
             <div style="display:inline-block;width:44px;height:44px;line-height:44px;border-radius:10px;background:#dc2626;color:#ffffff;font-size:22px;font-weight:bold;margin-bottom:12px;">
               🛡️
             </div>
-            <h1 style="margin:0;font-size:22px;font-weight:700;color:#ffffff;letter-spacing:-0.02em;">Secure Vault</h1>
-            <p style="margin:4px 0 0;font-size:13px;color:#a1a1aa;">Protected Zero-Knowledge Document Infrastructure</p>
+            <h1 style="margin:0;font-size:22px;font-weight:700;color:#ffffff;letter-spacing:-0.02em;">DocQevrilo</h1>
+            <p style="margin:4px 0 0;font-size:13px;color:#a1a1aa;">One Code. Simple Sharing. — Secure Document Sharing Platform</p>
           </div>
 
           <!-- Body -->
           <div style="padding:32px;">
             <h2 style="margin:0 0 12px;font-size:18px;color:#ffffff;font-weight:600;">Reset your account password</h2>
             <p style="margin:0 0 20px;font-size:14px;line-height:1.6;color:#d4d4d8;">
-              We received a request to reset the password for your Secure Vault account. Use the 6-digit OTP code below or click the direct reset link.
+              We received a request to reset the password for your DocQevrilo account. Use the 6-digit OTP code below or click the direct reset link.
             </p>
 
             ${
