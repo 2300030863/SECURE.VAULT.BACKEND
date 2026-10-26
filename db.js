@@ -153,9 +153,14 @@ async function initDatabase() {
           full_name VARCHAR(255) NOT NULL,
           email VARCHAR(255) NOT NULL UNIQUE,
           password_hash VARCHAR(255) NOT NULL,
+          occupation VARCHAR(100) NULL,
+          security_pin_hash VARCHAR(255) NULL,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
+
+      await safeAddColumn(pool, "users", "occupation", "VARCHAR(100) NULL");
+      await safeAddColumn(pool, "users", "security_pin_hash", "VARCHAR(255) NULL");
 
       // 2. Documents Table (Metadata for Backblaze B2 objects)
       // Plain-text access codes are NEVER stored here; only access_code_hash is used for lookups.
@@ -259,45 +264,69 @@ async function initDatabase() {
 // User Operations
 // ---------------------------------------------------------------------------
 async function findUserByEmail(email) {
+  const normalizedEmail = email.toLowerCase().trim();
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, full_name, email, password_hash, created_at FROM users WHERE email = ? LIMIT 1`,
-      [email.toLowerCase().trim()]
+      `SELECT id, full_name, email, password_hash, occupation, security_pin_hash, created_at FROM users WHERE LOWER(email) = ? LIMIT 1`,
+      [normalizedEmail]
     );
     return rows[0] || null;
   } else {
     const users = loadLocalUsers();
-    return users.find((u) => u.email === email.toLowerCase().trim()) || null;
+    return users.find((u) => u.email === normalizedEmail) || null;
   }
 }
 
 async function findUserById(id) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, full_name, email, created_at FROM users WHERE id = ? LIMIT 1`,
+      `SELECT id, full_name, email, occupation, (security_pin_hash IS NOT NULL) AS has_security_pin, created_at FROM users WHERE id = ? LIMIT 1`,
+      [id]
+    );
+    if (!rows[0]) return null;
+    return {
+      ...rows[0],
+      has_security_pin: Boolean(rows[0].has_security_pin),
+    };
+  } else {
+    const users = loadLocalUsers();
+    const user = users.find((u) => u.id === Number(id));
+    if (!user) return null;
+    const { password_hash, security_pin_hash, ...safeUser } = user;
+    return {
+      ...safeUser,
+      has_security_pin: Boolean(security_pin_hash),
+    };
+  }
+}
+
+async function findUserWithSecretsById(id) {
+  if (isTiDBConnected && pool) {
+    const [rows] = await pool.query(
+      `SELECT id, full_name, email, password_hash, occupation, security_pin_hash, created_at FROM users WHERE id = ? LIMIT 1`,
       [id]
     );
     return rows[0] || null;
   } else {
     const users = loadLocalUsers();
-    const user = users.find((u) => u.id === Number(id));
-    if (!user) return null;
-    const { password_hash, ...safeUser } = user;
-    return safeUser;
+    return users.find((u) => u.id === Number(id)) || null;
   }
 }
 
-async function createUser({ full_name, email, password_hash }) {
+async function createUser({ full_name, email, password_hash, occupation = null, security_pin_hash = null }) {
   const normalizedEmail = email.toLowerCase().trim();
+  const cleanOccupation = occupation && typeof occupation === "string" ? occupation.trim() : null;
   if (isTiDBConnected && pool) {
     const [result] = await pool.query(
-      `INSERT INTO users (full_name, email, password_hash) VALUES (?, ?, ?)`,
-      [full_name.trim(), normalizedEmail, password_hash]
+      `INSERT INTO users (full_name, email, password_hash, occupation, security_pin_hash) VALUES (?, ?, ?, ?, ?)`,
+      [full_name.trim(), normalizedEmail, password_hash, cleanOccupation, security_pin_hash]
     );
     return {
       id: result.insertId,
       full_name: full_name.trim(),
       email: normalizedEmail,
+      occupation: cleanOccupation,
+      has_security_pin: Boolean(security_pin_hash),
       created_at: new Date().toISOString(),
     };
   } else {
@@ -312,13 +341,56 @@ async function createUser({ full_name, email, password_hash }) {
       full_name: full_name.trim(),
       email: normalizedEmail,
       password_hash,
+      occupation: cleanOccupation,
+      security_pin_hash,
       created_at: new Date().toISOString(),
     };
     users.push(newUser);
     saveLocalUsers(users);
-    const { password_hash: _, ...safeUser } = newUser;
-    return safeUser;
+    const { password_hash: _, security_pin_hash: __, ...safeUser } = newUser;
+    return {
+      ...safeUser,
+      has_security_pin: Boolean(security_pin_hash),
+    };
   }
+}
+
+async function updateUserProfile(id, { full_name, occupation, security_pin_hash }) {
+  const updates = [];
+  const params = [];
+  if (full_name && typeof full_name === "string" && full_name.trim()) {
+    updates.push("full_name = ?");
+    params.push(full_name.trim());
+  }
+  if (occupation !== undefined) {
+    updates.push("occupation = ?");
+    params.push(occupation && typeof occupation === "string" ? occupation.trim() : null);
+  }
+  if (security_pin_hash) {
+    updates.push("security_pin_hash = ?");
+    params.push(security_pin_hash);
+  }
+  if (updates.length > 0) {
+    params.push(id);
+    if (isTiDBConnected && pool) {
+      await pool.query(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`, params);
+    } else {
+      let users = loadLocalUsers();
+      users = users.map((u) => {
+        if (u.id === Number(id)) {
+          return {
+            ...u,
+            ...(full_name ? { full_name: full_name.trim() } : {}),
+            ...(occupation !== undefined ? { occupation: occupation ? occupation.trim() : null } : {}),
+            ...(security_pin_hash ? { security_pin_hash } : {}),
+          };
+        }
+        return u;
+      });
+      saveLocalUsers(users);
+    }
+  }
+  return await findUserById(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -344,8 +416,7 @@ function enrichDocumentStatus(doc, now = new Date()) {
 
   return {
     ...doc,
-    // Ensure access_code is NEVER returned in database reads for security
-    access_code: null,
+    access_code: doc.access_code || null,
     status,
     is_expired: isExpired,
     is_limit_reached: isLimitReached,
@@ -386,13 +457,14 @@ async function saveDocument({
       `INSERT INTO documents
         (owner_id, original_name, mime_type, storage_key, access_code_hash, access_code,
          file_size, expires_at, file_count, storage_mode, max_downloads, active_downloads, delete_after_download)
-       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 0, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
       [
         owner_id,
         original_name,
         mime_type || "application/zip",
         storage_key,
         access_code_hash,
+        access_code || null,
         file_size,
         expires_at || null,
         file_count || 1,
@@ -409,7 +481,7 @@ async function saveDocument({
       mime_type,
       storage_key,
       access_code_hash,
-      access_code: null, // Returned as null to prevent exposure
+      access_code: access_code || null,
       file_size,
       file_count: file_count || 1,
       storage_mode: normStorageMode,
@@ -434,7 +506,7 @@ async function saveDocument({
       mime_type: mime_type || "application/zip",
       storage_key,
       access_code_hash,
-      access_code: null,
+      access_code: access_code || null,
       file_size,
       file_count: file_count || 1,
       storage_mode: normStorageMode,
@@ -491,7 +563,7 @@ async function findDocumentById(id) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
       `SELECT id, owner_id, original_name, mime_type, storage_key, access_code_hash,
-              NULL AS access_code, file_size, expires_at, created_at,
+              access_code, file_size, expires_at, created_at,
               COALESCE(view_count, 0) AS view_count,
               COALESCE(download_count, 0) AS download_count,
               COALESCE(file_count, 1) AS file_count,
@@ -703,7 +775,7 @@ async function listUserDocuments(owner_id, limit = 50) {
 
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, owner_id, original_name, mime_type, NULL AS access_code, file_size, expires_at, created_at,
+      `SELECT id, owner_id, original_name, mime_type, access_code, file_size, expires_at, created_at,
               COALESCE(view_count, 0) AS view_count,
               COALESCE(download_count, 0) AS download_count,
               COALESCE(file_count, 1) AS file_count,
@@ -915,6 +987,19 @@ async function getConnection() {
   throw new Error("TiDB Cloud database pool is not available");
 }
 
+async function updateDocumentAccessCode(id, newCode, newHash) {
+  if (isTiDBConnected && pool) {
+    await pool.query(
+      `UPDATE documents SET access_code = ?, access_code_hash = ? WHERE id = ?`,
+      [newCode, newHash, id]
+    );
+  } else {
+    let docs = loadLocalDocs();
+    docs = docs.map((d) => (Number(d.id) === Number(id) ? { ...d, access_code: newCode, access_code_hash: newHash } : d));
+    saveLocalDocs(docs);
+  }
+}
+
 module.exports = {
   initDatabase,
   getPool,
@@ -923,11 +1008,14 @@ module.exports = {
   getConnection,
   findUserByEmail,
   findUserById,
+  findUserWithSecretsById,
   createUser,
+  updateUserProfile,
   saveDocument,
   findDocumentByHash,
   findDocumentById,
   updateDocument,
+  updateDocumentAccessCode,
   deleteDocument,
   listRecentDocuments,
   listUserDocuments,

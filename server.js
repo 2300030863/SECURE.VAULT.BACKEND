@@ -27,16 +27,18 @@ const { finished, pipeline } = require("stream/promises");
 require("dotenv").config();
 
 const { generateCode, hashCode, legacyHashCode, isValidCodeFormat } = require("./codeGenerator");
-const authRoutes = require("./authRoutes");
 const {
   initDatabase,
   findUserByEmail,
   findUserById,
+  findUserWithSecretsById,
   createUser,
+  updateUserProfile,
   saveDocument,
   findDocumentByHash,
   findDocumentById,
   updateDocument,
+  updateDocumentAccessCode,
   deleteDocument,
   listRecentDocuments,
   listUserDocuments,
@@ -50,6 +52,16 @@ const {
   finalizeDownload,
   getDbStatus
 } = require("./db");
+const { sendAccessCodeOtpEmail } = require("./mailer");
+const authRoutes = require("./authRoutes");
+const {
+  extractDocumentText,
+  generateSummary,
+  answerQuestion,
+  generateQuiz,
+  getGroqApiKey,
+  textCache,
+} = require("./aiService");
 const {
   isB2Configured,
   isB2Connected,
@@ -106,7 +118,15 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"]
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "Accept",
+      "Origin",
+      "X-Access-Code",
+      "x-access-code",
+    ],
   })
 );
 
@@ -181,11 +201,22 @@ const uploadLimiter = rateLimit({
   }
 });
 
-// JWT Middleware
-const optionalAuth = (req, res, next) => {
+// Helper to extract JWT token from request (header or query param)
+const extractToken = (req) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
-    const token = authHeader.substring(7);
+    return authHeader.substring(7);
+  }
+  if (req.query && (req.query.token || req.query.auth_token)) {
+    return req.query.token || req.query.auth_token;
+  }
+  return null;
+};
+
+// JWT Middleware
+const optionalAuth = (req, res, next) => {
+  const token = extractToken(req);
+  if (token) {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
       req.user = decoded;
@@ -199,14 +230,13 @@ const optionalAuth = (req, res, next) => {
 };
 
 const requireAuth = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  const token = extractToken(req);
+  if (!token) {
     return res.status(401).json({
       error: "You must be signed in to upload documents. Please create an account or sign in.",
       requireAuth: true
     });
   }
-  const token = authHeader.substring(7);
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
@@ -324,7 +354,7 @@ app.use("/api/auth", authRoutes);
 // 1. Register User
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { fullName, email, password } = req.body;
+    const { fullName, email, password, occupation, securityPin } = req.body;
     if (!fullName || typeof fullName !== "string" || fullName.trim().length < 2) {
       return res.status(400).json({ error: "Full name must be at least 2 characters." });
     }
@@ -334,6 +364,12 @@ app.post("/api/auth/register", async (req, res) => {
     if (!password || password.length < 8) {
       return res.status(400).json({ error: "Password must be at least 8 characters long." });
     }
+    if (securityPin) {
+      const cleanPin = String(securityPin).trim();
+      if (!/^\d{4}$/.test(cleanPin)) {
+        return res.status(400).json({ error: "Security PIN must be exactly 4 digits (0-9)." });
+      }
+    }
 
     const existingUser = await findUserByEmail(email);
     if (existingUser) {
@@ -341,16 +377,27 @@ app.post("/api/auth/register", async (req, res) => {
     }
 
     const password_hash = await bcrypt.hash(password, 10);
+    const security_pin_hash = securityPin ? await bcrypt.hash(String(securityPin).trim(), 10) : null;
+    const cleanOccupation = occupation && typeof occupation === "string" ? occupation.trim() : null;
+
     const newUser = await createUser({
       full_name: fullName,
       email,
-      password_hash
+      password_hash,
+      occupation: cleanOccupation,
+      security_pin_hash,
     });
 
     res.status(201).json({
       success: true,
       message: "Account created successfully. You can now sign in.",
-      user: { id: newUser.id, name: newUser.full_name, email: newUser.email }
+      user: {
+        id: newUser.id,
+        name: newUser.full_name,
+        email: newUser.email,
+        occupation: newUser.occupation,
+        has_security_pin: Boolean(security_pin_hash),
+      }
     });
   } catch (err) {
     console.error("[Auth Register Error]", err);
@@ -368,7 +415,6 @@ app.post("/api/auth/login", accessLimiter, async (req, res) => {
 
     const user = await findUserByEmail(email);
     if (!user) {
-      // Do not reveal whether user exists
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
@@ -389,7 +435,9 @@ app.post("/api/auth/login", accessLimiter, async (req, res) => {
       user: {
         id: user.id,
         name: user.full_name,
-        email: user.email
+        email: user.email,
+        occupation: user.occupation,
+        has_security_pin: Boolean(user.security_pin_hash),
       }
     });
   } catch (err) {
@@ -398,20 +446,79 @@ app.post("/api/auth/login", accessLimiter, async (req, res) => {
   }
 });
 
-// 3. Current User
+// 3. Current User Profile
 app.get("/api/auth/me", requireAuth, async (req, res) => {
   try {
     const user = await findUserById(req.user.id);
     if (!user) {
       return res.status(404).json({ error: "User not found." });
     }
-    res.json({ success: true, user });
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        name: user.full_name,
+        email: user.email,
+        occupation: user.occupation,
+        has_security_pin: Boolean(user.has_security_pin),
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: "Failed to retrieve user profile." });
   }
 });
 
-// 4. Logout
+// 4. Update Profile & Security PIN
+app.put("/api/auth/profile", requireAuth, async (req, res) => {
+  try {
+    const { fullName, occupation, newPin, currentPassword } = req.body;
+
+    const user = await findUserWithSecretsById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ error: "User account not found." });
+    }
+
+    // If currentPassword is provided and not equal to newPin, verify it against user's password_hash
+    if (currentPassword && typeof currentPassword === "string" && currentPassword.trim() && currentPassword !== newPin) {
+      const isMatch = await bcrypt.compare(currentPassword.trim(), user.password_hash);
+      if (!isMatch) {
+        return res.status(401).json({ error: "Incorrect account login password entered." });
+      }
+    }
+
+    let security_pin_hash = undefined;
+    if (newPin !== undefined && newPin !== null && newPin !== "") {
+      const cleanPin = String(newPin).trim();
+      if (!/^\d{4}$/.test(cleanPin)) {
+        return res.status(400).json({ error: "Security PIN must be exactly 4 digits (0-9)." });
+      }
+      security_pin_hash = await bcrypt.hash(cleanPin, 10);
+    }
+
+    const updated = await updateUserProfile(user.id, {
+      full_name: fullName,
+      occupation,
+      security_pin_hash,
+    });
+
+    res.json({
+      success: true,
+      message: "Profile updated successfully.",
+      user: {
+        id: updated.id,
+        name: updated.full_name,
+        email: updated.email,
+        occupation: updated.occupation,
+        has_security_pin: Boolean(updated.has_security_pin || security_pin_hash),
+      },
+    });
+  } catch (err) {
+    console.error("[Profile Update Error]", err);
+    res.status(500).json({ error: err.message || "Failed to update profile." });
+  }
+});
+
+// 5. Logout
 app.post("/api/auth/logout", (req, res) => {
   res.json({ success: true, message: "Logged out successfully." });
 });
@@ -814,8 +921,11 @@ function formatBytesServer(bytes) {
 }
 
 // Render responsive HTML viewer for multi-file archives
-// Render responsive HTML viewer for multi-file archives
-function renderArchiveViewerHtml(doc, entries, codeParam) {
+function renderArchiveViewerHtml(doc, entries, codeParam, req = null) {
+  const token = (req && req.query && (req.query.token || req.query.auth_token)) ? (req.query.token || req.query.auth_token) : "";
+  const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
+  const isOwnerRoute = (!codeParam || codeParam === "") && doc.id;
+
   const fileItemsHtml = entries
     .map((e) => {
       const cleanName = e.entryName.replace(/^(\d+_)+/, "");
@@ -829,8 +939,12 @@ function renderArchiveViewerHtml(doc, entries, codeParam) {
       else if ([".zip", ".tar", ".gz"].includes(ext)) icon = "📦";
 
       const sizeStr = formatBytesServer(e.header ? e.header.size : 0);
-      const viewFileUrl = `/api/documents/download/${codeParam}?action=view&file=${encodeURIComponent(e.entryName)}`;
-      const downloadFileUrl = `/api/documents/download/${codeParam}?action=download&file=${encodeURIComponent(e.entryName)}`;
+      const viewFileUrl = isOwnerRoute
+        ? `/api/documents/owner/${doc.id}/view?file=${encodeURIComponent(e.entryName)}${tokenQuery}`
+        : `/api/documents/download/${codeParam}?action=view&file=${encodeURIComponent(e.entryName)}`;
+      const downloadFileUrl = isOwnerRoute
+        ? `/api/documents/owner/${doc.id}/download?file=${encodeURIComponent(e.entryName)}${tokenQuery}`
+        : `/api/documents/download/${codeParam}?action=download&file=${encodeURIComponent(e.entryName)}`;
 
       return `
         <div class="file-item">
@@ -853,6 +967,10 @@ function renderArchiveViewerHtml(doc, entries, codeParam) {
       `;
     })
     .join("");
+
+  const dlAllUrl = isOwnerRoute
+    ? `/api/documents/owner/${doc.id}/download?format=zip${token ? `&token=${encodeURIComponent(token)}` : ""}`
+    : `/api/documents/download/${codeParam}?action=download`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1062,7 +1180,7 @@ function renderArchiveViewerHtml(doc, entries, codeParam) {
       ${fileItemsHtml}
     </div>
 
-    <a href="/api/documents/download/${codeParam}?action=download" class="dl-all">
+    <a href="${dlAllUrl}" class="dl-all">
       📦 Download Entire Archive as .ZIP
     </a>
   </div>
@@ -1230,7 +1348,7 @@ async function streamDocumentToResponse(doc, req, res) {
         await incrementViewCount(doc.id);
         const codeParam = encodeURIComponent(req.params.access_code || req.query.code || "");
         res.setHeader("Content-Type", "text/html; charset=utf-8");
-        return res.send(renderArchiveViewerHtml(doc, entries, codeParam));
+        return res.send(renderArchiveViewerHtml(doc, entries, codeParam, req));
       }
     }
 
@@ -1624,6 +1742,172 @@ app.put("/api/documents/:id", requireAuth, async (req, res) => {
   }
 });
 
+// Map to store temporary 6-digit OTPs for Access Code security verification: Map<userId, { codeHash: string, expiresAt: number, action: string, docId: number }>
+const accessCodeOtps = new Map();
+
+// Helper to verify 2FA credentials (Password + PIN or Password + OTP)
+async function verifyUserForCodeAction(userId, docId, body = {}) {
+  const { password, method, pin, securityPin, otp } = body;
+  if (!password || typeof password !== "string") {
+    const err = new Error("Your account login password is required.");
+    err.status = 401;
+    throw err;
+  }
+
+  const user = await findUserWithSecretsById(userId);
+  if (!user) {
+    const err = new Error("User account not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+  if (!isPasswordValid) {
+    const err = new Error("Incorrect account login password.");
+    err.status = 401;
+    throw err;
+  }
+
+  const rawPin = pin || securityPin;
+  const cleanPin = rawPin && typeof rawPin === "string" ? rawPin.trim() : "";
+  const cleanOtp = otp && typeof otp === "string" ? otp.trim() : "";
+  const resolvedMethod = method || (cleanPin ? "pin" : cleanOtp ? "otp" : "");
+
+  if (resolvedMethod === "pin") {
+    if (!cleanPin || !/^\d{4}$/.test(cleanPin)) {
+      const err = new Error("Please enter your valid 4-digit Security PIN.");
+      err.status = 400;
+      throw err;
+    }
+    if (!user.security_pin_hash) {
+      const err = new Error("No 4-digit Security PIN is configured on your profile. Please use Email OTP or set your PIN in Profile.");
+      err.status = 400;
+      throw err;
+    }
+    const isPinValid = await bcrypt.compare(cleanPin, user.security_pin_hash);
+    if (!isPinValid) {
+      const err = new Error("Incorrect 4-digit Security PIN.");
+      err.status = 401;
+      throw err;
+    }
+  } else if (resolvedMethod === "otp") {
+    if (!cleanOtp || !/^\d{6}$/.test(cleanOtp)) {
+      const err = new Error("Please enter the 6-digit OTP sent to your email.");
+      err.status = 400;
+      throw err;
+    }
+    const record = accessCodeOtps.get(userId);
+    if (!record || Date.now() > record.expiresAt) {
+      const err = new Error("Verification OTP has expired or was not requested. Please click 'Send OTP' to receive a new code.");
+      err.status = 400;
+      throw err;
+    }
+    const inputHash = crypto.createHash("sha256").update(cleanOtp).digest("hex");
+    if (inputHash !== record.codeHash) {
+      const err = new Error("Invalid 6-digit OTP code.");
+      err.status = 401;
+      throw err;
+    }
+    // Invalidate consumed OTP
+    accessCodeOtps.delete(userId);
+  } else {
+    const err = new Error("Invalid verification method. Please select 4-Digit Security PIN or Email OTP.");
+    err.status = 400;
+    throw err;
+  }
+
+  return user;
+}
+
+// Request Email OTP for revealing or regenerating access code
+app.post("/api/documents/request-code-otp", requireAuth, accessLimiter, async (req, res) => {
+  try {
+    const { docId, action } = req.body;
+    if (!docId) {
+      return res.status(400).json({ error: "Document ID is required." });
+    }
+    const doc = await findDocumentById(docId);
+    if (!doc) {
+      return res.status(404).json({ error: "Document not found." });
+    }
+    if (doc.owner_id && Number(doc.owner_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: "Unauthorized access to document." });
+    }
+
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const codeHash = crypto.createHash("sha256").update(otpCode).digest("hex");
+
+    accessCodeOtps.set(req.user.id, {
+      codeHash,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+      action: action || "reveal",
+      docId: doc.id,
+    });
+
+    await sendAccessCodeOtpEmail(req.user.email, otpCode, doc.original_name, action || "reveal");
+
+    res.json({
+      success: true,
+      message: `A 6-digit verification OTP has been sent to ${req.user.email}.`,
+    });
+  } catch (err) {
+    console.error("[Request Code OTP Error]", err);
+    res.status(500).json({ error: err.message || "Failed to send verification OTP." });
+  }
+});
+
+// Verify credentials and reveal access code
+app.post("/api/documents/:id/verify-and-reveal", requireAuth, accessLimiter, async (req, res) => {
+  try {
+    const docId = req.params.id;
+    const doc = await findDocumentById(docId);
+    if (!doc) {
+      return res.status(404).json({ error: "Document not found." });
+    }
+    if (doc.owner_id && Number(doc.owner_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: "Unauthorized access to document." });
+    }
+
+    await verifyUserForCodeAction(req.user.id, doc.id, req.body);
+
+    res.json({
+      success: true,
+      access_code: doc.access_code,
+    });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "Verification failed." });
+  }
+});
+
+// Regenerate Document Access Code (Requires Password + PIN or Password + OTP)
+app.post("/api/documents/:id/regenerate-code", requireAuth, accessLimiter, async (req, res) => {
+  try {
+    const docId = req.params.id;
+    const doc = await findDocumentById(docId);
+    if (!doc) {
+      return res.status(404).json({ error: "Document not found." });
+    }
+    if (!doc.owner_id || Number(doc.owner_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: "You do not have permission to regenerate code for this document." });
+    }
+
+    await verifyUserForCodeAction(req.user.id, doc.id, req.body);
+
+    const newCode = generateCode();
+    const newHash = hashCode(newCode);
+
+    await updateDocumentAccessCode(doc.id, newCode, newHash);
+
+    res.json({
+      success: true,
+      message: "Access code regenerated successfully.",
+      access_code: newCode,
+    });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "Failed to regenerate access code." });
+  }
+});
+
 // Delete Document (Requires Authentication)
 app.delete("/api/documents/:id", requireAuth, async (req, res) => {
   try {
@@ -1730,18 +2014,27 @@ app.get("/api/documents/mine", requireAuth, async (req, res) => {
   try {
     await purgeExpiredDocuments();
     const docs = await listUserDocuments(req.user.id, 50);
+
+    // Provide a fresh user token query parameter so direct browser navigations (iframe / new tab / download) succeed seamlessly
+    const userToken = jwt.sign(
+      { id: req.user.id, email: req.user.email },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    const tokenParam = `token=${encodeURIComponent(userToken)}`;
+
     const enrichedDocs = docs.map((doc) => {
       const codeParam = doc.access_code ? encodeURIComponent(doc.access_code) : "";
       return {
         ...doc,
         view_url: doc.access_code
           ? `/api/documents/view/${codeParam}`
-          : `/api/documents/owner/${doc.id}/view`,
+          : `/api/documents/owner/${doc.id}/view?${tokenParam}`,
         download_url: doc.access_code
           ? `/api/documents/download/${codeParam}?action=download`
-          : `/api/documents/owner/${doc.id}/download`,
-        owner_view_url: `/api/documents/owner/${doc.id}/view`,
-        owner_download_url: `/api/documents/owner/${doc.id}/download`
+          : `/api/documents/owner/${doc.id}/download?${tokenParam}`,
+        owner_view_url: `/api/documents/owner/${doc.id}/view?${tokenParam}`,
+        owner_download_url: `/api/documents/owner/${doc.id}/download?${tokenParam}`
       };
     });
     res.json({
@@ -1802,13 +2095,196 @@ app.get("/api/documents/recent", optionalAuth, async (req, res) => {
     await purgeExpiredDocuments();
 
     const docs = await listUserDocuments(req.user.id, 50);
+    const userToken = jwt.sign(
+      { id: req.user.id, email: req.user.email },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    const tokenParam = `token=${encodeURIComponent(userToken)}`;
+
+    const enrichedDocs = docs.map((doc) => {
+      const codeParam = doc.access_code ? encodeURIComponent(doc.access_code) : "";
+      return {
+        ...doc,
+        view_url: doc.access_code
+          ? `/api/documents/view/${codeParam}`
+          : `/api/documents/owner/${doc.id}/view?${tokenParam}`,
+        download_url: doc.access_code
+          ? `/api/documents/download/${codeParam}?action=download`
+          : `/api/documents/owner/${doc.id}/download?${tokenParam}`,
+        owner_view_url: `/api/documents/owner/${doc.id}/view?${tokenParam}`,
+        owner_download_url: `/api/documents/owner/${doc.id}/download?${tokenParam}`
+      };
+    });
     res.json({
       success: true,
-      documents: docs
+      documents: enrichedDocs
     });
   } catch (err) {
     console.error("List error:", err);
     res.status(500).json({ error: "Failed to list recent documents." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DOCQEVRILO AI ASSISTANT ROUTES (Powered by Groq Cloud & Llama 3.3 70B)
+// ---------------------------------------------------------------------------
+
+// Helper: Authorize document access for AI operations (owner or valid access code)
+async function resolveDocumentForAi(docId, req) {
+  const doc = await findDocumentById(docId);
+  if (!doc) {
+    const err = new Error("Document not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  // Check expiration
+  if (doc.expires_at && new Date() > new Date(doc.expires_at)) {
+    const err = new Error("This document has expired and is no longer available.");
+    err.status = 410;
+    throw err;
+  }
+
+  const isOwner = req.user && doc.owner_id && Number(req.user.id) === Number(doc.owner_id);
+  const providedCode = req.headers["x-access-code"] || req.query.code || req.body?.access_code;
+  const isCodeValid =
+    providedCode &&
+    (hashCode(providedCode.trim()) === doc.access_code_hash ||
+      legacyHashCode(providedCode.trim()) === doc.access_code_hash);
+
+  if (!isOwner && !isCodeValid) {
+    const err = new Error("Unauthorized to access this document for AI analysis. Please provide valid access credentials.");
+    err.status = 403;
+    throw err;
+  }
+
+  return doc;
+}
+
+// Helper: Retrieve and extract document text buffer
+async function getDocumentExtractedText(doc) {
+  if (textCache.has(doc.id)) {
+    return textCache.get(doc.id);
+  }
+
+  const buffer = await getDocumentBuffer(doc.storage_key);
+  const extracted = await extractDocumentText(buffer, doc.original_name, doc.mime_type);
+  textCache.set(doc.id, extracted);
+  return extracted;
+}
+
+// AI Status & Configuration Check
+app.get("/api/ai/status", optionalAuth, (req, res) => {
+  const apiKey = getGroqApiKey();
+  res.json({
+    enabled: Boolean(apiKey),
+    provider: "Groq Cloud",
+    model: process.env.GROQ_MODEL || "qwen/qwen3.8-27b",
+    fallbackModel: "openai/gpt-oss-120b",
+    features: ["summarizer", "ask_ai", "quiz_generator"],
+  });
+});
+
+// Optional: Configure or update GROQ_API_KEY from frontend
+app.post("/api/ai/config", requireAuth, async (req, res) => {
+  try {
+    const { apiKey } = req.body;
+    if (!apiKey || typeof apiKey !== "string" || !apiKey.trim().startsWith("gsk_")) {
+      return res.status(400).json({ error: "Please enter a valid Groq API Key (starts with gsk_)." });
+    }
+
+    process.env.GROQ_API_KEY = apiKey.trim();
+    res.json({
+      success: true,
+      message: "Groq API Key configured successfully.",
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "Failed to configure Groq API Key." });
+  }
+});
+
+// 1. AI Document Summarizer
+app.post("/api/ai/documents/:id/summary", optionalAuth, accessLimiter, async (req, res) => {
+  try {
+    const doc = await resolveDocumentForAi(req.params.id, req);
+    const mode = req.body?.mode || "detailed"; // 'detailed' | 'quick' | 'exam'
+    const { fullText } = await getDocumentExtractedText(doc);
+
+    if (!fullText || fullText.length < 20) {
+      return res.status(400).json({
+        error: "This document contains no readable text to summarize (it may be an image or binary archive).",
+      });
+    }
+
+    const summaryResult = await generateSummary(doc.id, fullText, doc.original_name, mode);
+    res.json({
+      success: true,
+      documentName: doc.original_name,
+      ...summaryResult,
+    });
+  } catch (err) {
+    console.error("[AI Summary Error]", err);
+    res.status(err.status || 500).json({ error: err.message || "Failed to generate AI summary." });
+  }
+});
+
+// 2. Ask AI - Context-Aware Q&A with Citations
+app.post("/api/ai/documents/:id/chat", optionalAuth, accessLimiter, async (req, res) => {
+  try {
+    const doc = await resolveDocumentForAi(req.params.id, req);
+    const { question, history } = req.body;
+
+    if (!question || typeof question !== "string" || !question.trim()) {
+      return res.status(400).json({ error: "Please enter a question to ask the AI." });
+    }
+
+    const { fullText, chunks } = await getDocumentExtractedText(doc);
+    if (!fullText || fullText.length < 20) {
+      return res.status(400).json({
+        error: "This document contains no readable text for answering questions.",
+      });
+    }
+
+    const answerResult = await answerQuestion(doc.id, fullText, chunks, question.trim(), history || []);
+    res.json({
+      success: true,
+      documentName: doc.original_name,
+      ...answerResult,
+    });
+  } catch (err) {
+    console.error("[AI Chat Error]", err);
+    res.status(err.status || 500).json({ error: err.message || "Failed to answer question." });
+  }
+});
+
+// 3. AI Quiz Generator - Customizable MCQs
+app.post("/api/ai/documents/:id/quiz", optionalAuth, accessLimiter, async (req, res) => {
+  try {
+    const doc = await resolveDocumentForAi(req.params.id, req);
+    const { topic, difficulty, questionCount } = req.body || {};
+
+    const { fullText } = await getDocumentExtractedText(doc);
+    if (!fullText || fullText.length < 20) {
+      return res.status(400).json({
+        error: "This document contains no readable text to generate quiz questions from.",
+      });
+    }
+
+    const quizResult = await generateQuiz(doc.id, fullText, {
+      topic: topic || "All Topics",
+      difficulty: difficulty || "medium",
+      questionCount: questionCount || 5,
+    });
+
+    res.json({
+      success: true,
+      documentName: doc.original_name,
+      ...quizResult,
+    });
+  } catch (err) {
+    console.error("[AI Quiz Error]", err);
+    res.status(err.status || 500).json({ error: err.message || "Failed to generate quiz." });
   }
 });
 

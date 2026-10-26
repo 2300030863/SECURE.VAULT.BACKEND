@@ -131,4 +131,77 @@ async function sendResetEmail(email, resetUrl, otpCode = "") {
   return { messageId: "sent", simulated: false, otpCode };
 }
 
-module.exports = { sendResetEmail, isEmailConfigured: () => Boolean(createTransporter()) };
+/**
+ * Sends a 6-digit OTP email to verify revealing or regenerating a document access code.
+ * @param {string} email - Destination email address
+ * @param {string} otpCode - 6-digit OTP code
+ * @param {string} docName - Document name or title
+ * @param {string} action - 'reveal' or 'regenerate'
+ */
+async function sendAccessCodeOtpEmail(email, otpCode, docName = "Document Archive", action = "reveal") {
+  const transporter = createTransporter();
+  if (!transporter) {
+    const error = new Error("Gmail credentials are not configured in backend/.env.");
+    error.code = "SMTP_NOT_CONFIGURED";
+    throw error;
+  }
+
+  const sender = process.env.GMAIL_USER.trim();
+  const actionLabel = action === "regenerate" ? "Regenerate Vault Access Code" : "Reveal Vault Access Code";
+
+  await transporter.sendMail({
+    from: `"DocQevrilo Vault Security" <${sender}>`,
+    to: email,
+    subject: `Your Security OTP to ${actionLabel}: ${otpCode}`,
+    text: [
+      `Security verification request for DocQevrilo Vault: "${docName}".`,
+      "",
+      `Your 6-Digit Verification Code is: ${otpCode}`,
+      "",
+      "Enter this code along with your account password to authorize this action.",
+      "This verification code expires in 10 minutes and can only be used once.",
+      "If you did not request this verification, please sign into your DocQevrilo account and update your password immediately.",
+    ].join("\n"),
+    html: `
+      <div style="background-color:#09090b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#fafafa;padding:32px 16px;">
+        <div style="max-width:540px;margin:0 auto;background:#18181b;border:1px solid #27272a;border-radius:16px;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,0.5);">
+          <div style="padding:24px 28px;background:linear-gradient(180deg,#1f1f23 0%,#18181b 100%);border-bottom:1px solid #27272a;text-align:center;">
+            <div style="display:inline-block;width:44px;height:44px;line-height:44px;border-radius:10px;background:#dc2626;color:#ffffff;font-size:22px;margin-bottom:10px;">
+              🛡️
+            </div>
+            <h1 style="margin:0;font-size:20px;font-weight:700;color:#ffffff;">DocQevrilo Vault Security</h1>
+            <p style="margin:4px 0 0;font-size:12px;color:#a1a1aa;">Two-Factor Access Code Authorization</p>
+          </div>
+          <div style="padding:28px;">
+            <h2 style="margin:0 0 10px;font-size:16px;color:#ffffff;font-weight:600;">Authorize: ${actionLabel}</h2>
+            <p style="margin:0 0 16px;font-size:13px;line-height:1.6;color:#d4d4d8;">
+              A request was initiated on your DocQevrilo account to ${action === "regenerate" ? "regenerate a new access code for" : "reveal the protected access code for"}: <strong>${docName}</strong>.
+            </p>
+            <div style="text-align:center;margin:20px 0;background:#09090b;padding:18px;border-radius:12px;border:1px solid #3f3f46;">
+              <p style="margin:0 0 6px;font-size:11px;color:#a1a1aa;text-transform:uppercase;letter-spacing:1px;">Your 6-Digit Verification OTP</p>
+              <div style="font-size:32px;font-weight:800;letter-spacing:8px;color:#f87171;font-family:monospace;">
+                ${otpCode}
+              </div>
+            </div>
+            <div style="background:#27272a;padding:12px 14px;border-radius:8px;border-left:3px solid #dc2626;margin:18px 0;">
+              <p style="margin:0;font-size:12px;color:#e4e4e7;line-height:1.5;">
+                ⏱️ This security OTP expires in <strong>10 minutes</strong>. Never share this code with anyone.
+              </p>
+            </div>
+            <p style="margin:20px 0 0;font-size:11px;color:#71717a;line-height:1.5;border-top:1px solid #27272a;padding-top:16px;">
+              If you did not request this, please secure your account immediately.
+            </p>
+          </div>
+        </div>
+      </div>
+    `,
+  });
+
+  return { messageId: "sent", otpCode };
+}
+
+module.exports = {
+  sendResetEmail,
+  sendAccessCodeOtpEmail,
+  isEmailConfigured: () => Boolean(createTransporter())
+};
