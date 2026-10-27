@@ -2868,10 +2868,12 @@ app.post("/api/ai/documents/:id/quiz", optionalAuth, accessLimiter, async (req, 
       });
     }
 
+    const refresh = Boolean(req.body?.refresh || req.query?.refresh);
     const quizResult = await generateQuiz(doc.id, fullText, {
       topic: topic || "All Topics",
       difficulty: difficulty || "medium",
       questionCount: questionCount || 5,
+      refresh,
     });
 
     res.json({

@@ -727,14 +727,83 @@ Guidelines:
 }
 
 /**
+ * Helper: Safely parse and recover JSON quiz questions from AI text output
+ */
+function parseQuizJson(rawText) {
+  if (!rawText || typeof rawText !== "string") return [];
+
+  const trimmed = rawText.trim();
+
+  // 1. Direct parse attempt
+  try {
+    const direct = JSON.parse(trimmed);
+    if (Array.isArray(direct)) return direct;
+    if (Array.isArray(direct.questions)) return direct.questions;
+    if (Array.isArray(direct.quiz)) return direct.quiz;
+  } catch (_) {}
+
+  // 2. Strip standard markdown code blocks
+  const withoutFences = trimmed
+    .replace(/^```json\s*/im, "")
+    .replace(/^```\s*/im, "")
+    .replace(/\s*```$/m, "")
+    .trim();
+
+  try {
+    const parsed = JSON.parse(withoutFences);
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed.questions)) return parsed.questions;
+    if (Array.isArray(parsed.quiz)) return parsed.quiz;
+  } catch (_) {}
+
+  // 3. Extract array between first [ and last ]
+  const firstBracket = rawText.indexOf("[");
+  const lastBracket = rawText.lastIndexOf("]");
+  if (firstBracket !== -1 && lastBracket > firstBracket) {
+    try {
+      const arrayStr = rawText.slice(firstBracket, lastBracket + 1);
+      const parsed = JSON.parse(arrayStr);
+      if (Array.isArray(parsed)) return parsed;
+    } catch (_) {}
+  }
+
+  // 4. Extract object between first { and last } (e.g. { "questions": [...] })
+  const firstBrace = rawText.indexOf("{");
+  const lastBrace = rawText.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      const objStr = rawText.slice(firstBrace, lastBrace + 1);
+      const parsed = JSON.parse(objStr);
+      if (Array.isArray(parsed.questions)) return parsed.questions;
+      if (Array.isArray(parsed.quiz)) return parsed.quiz;
+    } catch (_) {}
+  }
+
+  // 5. Recovery parser: if JSON was cut off mid-stream, close the last complete question object
+  if (firstBracket !== -1) {
+    const candidate = rawText.slice(firstBracket);
+    const lastCompleteObj = candidate.lastIndexOf("}");
+    if (lastCompleteObj !== -1) {
+      try {
+        const repaired = candidate.slice(0, lastCompleteObj + 1) + "]";
+        const parsed = JSON.parse(repaired);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      } catch (_) {}
+    }
+  }
+
+  return [];
+}
+
+/**
  * 3. AI Study Quiz Generator
  * Generates customizable MCQs with options, correct answer index, explanations, and cited sections
  */
-async function generateQuiz(docId, documentText, { topic = "All Topics", difficulty = "medium", questionCount = 5 }) {
+async function generateQuiz(docId, documentText, { topic = "All Topics", difficulty = "medium", questionCount = 5, refresh = false }) {
   const count = Math.min(Math.max(parseInt(questionCount, 10) || 5, 3), 10);
   const cacheKey = `${docId}_${topic}_${difficulty}_${count}`;
 
-  if (quizCache.has(cacheKey)) {
+  if (!refresh && quizCache.has(cacheKey)) {
     return quizCache.get(cacheKey);
   }
 
@@ -744,9 +813,9 @@ Generate exactly ${count} multiple-choice questions (MCQs) testing understanding
 Target Topic: "${topic}"
 Difficulty Level: "${difficulty}"
 
-Requirements:
-1. Return ONLY a valid JSON array of objects without Markdown code fences, prose, or explanations outside the JSON.
-2. Each question object MUST contain:
+CRITICAL REQUIREMENTS:
+1. Return ONLY a valid JSON array of objects without Markdown code fences, text prefix, or conversational commentary.
+2. Each question object MUST have:
    - "id": number (1 to ${count})
    - "question": string
    - "options": array of exactly 4 strings
@@ -754,8 +823,17 @@ Requirements:
    - "explanation": string
    - "citation": string
 
-Example JSON:
-[{"id":1,"question":"...","options":["A","B","C","D"],"correctIndex":0,"explanation":"...","citation":"Page 1"}]`;
+Example Format:
+[
+  {
+    "id": 1,
+    "question": "What does the idiom 'bite the bullet' mean?",
+    "options": ["To eat something hard", "To face a difficult situation with courage", "To start a conflict", "To hurry up"],
+    "correctIndex": 1,
+    "explanation": "Biting the bullet means enduring a painful or difficult situation bravely.",
+    "citation": "Section 1"
+  }
+]`;
 
   let quizContext = documentText || "";
   if (quizContext.length > 7000) {
@@ -774,31 +852,42 @@ Example JSON:
 ${quizContext}
 """
 
-Generate ${count} ${difficulty} MCQs in JSON format testing across the provided content.`;
+Generate ${count} ${difficulty} MCQs in JSON format testing across the provided content. Return ONLY the JSON array.`;
+
+  // Scale token limit appropriately: 10 questions need ~2,500-3,000 tokens to avoid mid-JSON truncation
+  const quizMaxTokens = Math.min(Math.max(count * 350, 2000), 4000);
 
   const rawJson = await callGroqChat({
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ],
-    temperature: 0.25,
-    maxTokens: 800,
+    temperature: 0.2,
+    maxTokens: quizMaxTokens,
   });
 
-  let questions = [];
-  try {
-    const cleanJson = rawJson.replace(/```json/gi, "").replace(/```/g, "").trim();
-    questions = JSON.parse(cleanJson);
-  } catch (err) {
-    console.error("[Quiz JSON Parse Error]", err.message, "Raw:", rawJson.slice(0, 200));
+  const questions = parseQuizJson(rawJson);
+
+  if (!Array.isArray(questions) || questions.length === 0) {
+    console.error("[Quiz JSON Parse Failed] Raw output:", rawJson ? rawJson.slice(0, 300) : "empty");
     throw new Error("Failed to parse quiz response into structured format. Please retry.");
   }
+
+  // Clean and validate each question item
+  const validQuestions = questions.map((q, idx) => ({
+    id: q.id || idx + 1,
+    question: q.question || `Question ${idx + 1}`,
+    options: Array.isArray(q.options) && q.options.length >= 4 ? q.options.slice(0, 4) : ["Option A", "Option B", "Option C", "Option D"],
+    correctIndex: typeof q.correctIndex === "number" && q.correctIndex >= 0 && q.correctIndex <= 3 ? q.correctIndex : 0,
+    explanation: q.explanation || "No explanation provided.",
+    citation: q.citation || `Section ${idx + 1}`,
+  }));
 
   const result = {
     topic,
     difficulty,
-    questionCount: questions.length,
-    questions,
+    questionCount: validQuestions.length,
+    questions: validQuestions,
     model: lastSuccessfulModel || ACTIVE_MODEL,
     generatedAt: new Date().toISOString(),
   };
