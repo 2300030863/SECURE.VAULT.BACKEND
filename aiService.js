@@ -1,29 +1,30 @@
 /**
  * DocQevrilo AI Assistant Service
- * Powered by Groq Cloud API (Llama 3.3 70B Versatile / Llama 3.1 8B Instant)
- * Provides document text extraction, AI summarization, context-aware Q&A with citations,
+ * Powered by Groq Cloud API
+ * Provides robust document text extraction (PDF, DOCX, PPTX, TXT),
+ * chunked AI summarization, context-aware Q&A with citations,
  * and customizable exam/study quizzes.
  */
 
-const { default: pdfParse } = require("pdf-parse");
+const pdfParse = require("pdf-parse");
 const AdmZip = require("adm-zip");
+const mammoth = require("mammoth");
 require("dotenv").config();
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const CANDIDATE_MODELS = Array.from(
   new Set([
     process.env.GROQ_MODEL,
-    "qwen/qwen3.8-27b",
-    "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
   ].filter(Boolean))
 );
-const ACTIVE_MODEL = CANDIDATE_MODELS[0] || "qwen/qwen3.8-27b";
+const ACTIVE_MODEL = CANDIDATE_MODELS[0] || "openai/gpt-oss-20b";
 let lastSuccessfulModel = ACTIVE_MODEL;
 
-
-// Cache for extracted text, summaries, and generated quizzes
-const textCache = new Map(); // docId -> { text: string, pages: Array, extractedAt: number }
+// In-memory caches for extracted text, summaries, and generated quizzes
+const textCache = new Map(); // docId -> { fullText: string, chunks: Array, totalPages: number }
 const summaryCache = new Map(); // `${docId}_${mode}` -> summaryResult
 const quizCache = new Map(); // `${docId}_${topic}_${difficulty}_${count}` -> quizResult
 
@@ -35,152 +36,368 @@ function getGroqApiKey() {
 }
 
 /**
- * Extract clean, chunked text from a document buffer based on file extension / MIME type
- * @param {Buffer} buffer - Raw file or ZIP buffer
- * @param {string} originalName - Document filename
- * @param {string} mimeType - Document MIME type
+ * Safely chunk text into sections of at most maxChunkChars (~4,000 characters),
+ * splitting oversized paragraphs and preserving all content.
+ */
+function chunkTextBySections(text, maxChunkChars = 4000) {
+  const chunks = [];
+  if (!text || typeof text !== "string") return chunks;
+
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  let currentChunk = "";
+  let chunkIndex = 1;
+
+  function saveChunk(content) {
+    if (!content || !content.trim()) return;
+    chunks.push({
+      pageNum: chunkIndex,
+      label: `Section ${chunkIndex}`,
+      text: content.trim(),
+    });
+    chunkIndex++;
+  }
+
+  for (const para of paragraphs) {
+    // Split paragraphs that exceed the limit
+    if (para.length > maxChunkChars) {
+      if (currentChunk.trim()) {
+        saveChunk(currentChunk);
+        currentChunk = "";
+      }
+      for (let i = 0; i < para.length; i += maxChunkChars) {
+        saveChunk(para.slice(i, i + maxChunkChars));
+      }
+      continue;
+    }
+
+    const candidate = currentChunk ? `${currentChunk}\n\n${para}` : para;
+    if (candidate.length > maxChunkChars && currentChunk.trim()) {
+      saveChunk(currentChunk);
+      currentChunk = para;
+    } else {
+      currentChunk = candidate;
+    }
+  }
+
+  if (currentChunk.trim()) {
+    saveChunk(currentChunk);
+  }
+
+  return chunks;
+}
+
+/**
+ * Extract clean, validated text from a PDF buffer with page-level chunking
+ * @param {Buffer} pdfBuffer - Raw PDF buffer
+ * @param {string} filename - Filename for contextual error reporting
+ * @returns {Promise<{ fullText: string, chunks: Array<{ pageNum: number, label: string, text: string }>, totalPages: number }>}
+ */
+async function extractPdfText(pdfBuffer, filename = "document.pdf") {
+  if (!pdfBuffer || !Buffer.isBuffer(pdfBuffer) || pdfBuffer.length === 0) {
+    throw new Error(`Invalid or empty PDF buffer for "${filename}".`);
+  }
+
+  let pdfData;
+  try {
+    pdfData = await pdfParse(pdfBuffer);
+  } catch (err) {
+    console.error(`[PDF Parse Failed: ${filename}]`, err.message);
+    throw new Error(
+      `Unable to parse PDF "${filename}": ${err.message}. ` +
+      `Please ensure the PDF is not corrupted or password-protected.`
+    );
+  }
+
+  const rawText = (pdfData && pdfData.text) ? pdfData.text : "";
+  const cleanText = rawText
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n\s*\n+/g, "\n\n")
+    .trim();
+
+  // Validate that actual human-readable text was extracted
+  const nonWhitespaceCount = cleanText.replace(/\s+/g, "").length;
+  if (nonWhitespaceCount < 30) {
+    throw new Error(
+      `No readable text found in "${filename}" (${nonWhitespaceCount} characters). ` +
+      `This PDF may be scanned, image-based, or contain only non-extractable vectors. ` +
+      `Please provide a document containing selectable text.`
+    );
+  }
+
+  // Guard against raw PDF object / stream definitions slipping through
+  if (cleanText.includes("%PDF-") || (cleanText.includes("/FlateDecode") && cleanText.includes("/Length"))) {
+    throw new Error(
+      `Internal PDF syntax was detected instead of readable text for "${filename}". ` +
+      `Uncompressed text could not be extracted.`
+    );
+  }
+
+  const totalPages = pdfData.numpages || 1;
+  const chunks = [];
+
+  // Split into page chunks using Form Feed (\f) or standard "Page X" patterns
+  const pageStrings = cleanText.split(/\f|\n(?=Page\s+\d+)/i);
+
+  if (pageStrings.length > 1) {
+    pageStrings.forEach((pText, idx) => {
+      const trimmed = pText.trim();
+      if (trimmed) {
+        if (trimmed.length > 4000) {
+          const subChunks = chunkTextBySections(trimmed, 4000);
+          subChunks.forEach((sc, sIdx) => {
+            chunks.push({
+              pageNum: chunks.length + 1,
+              label: `Page ${idx + 1} (Part ${sIdx + 1})`,
+              text: sc.text,
+            });
+          });
+        } else {
+          chunks.push({
+            pageNum: chunks.length + 1,
+            label: `Page ${idx + 1}`,
+            text: trimmed,
+          });
+        }
+      }
+    });
+  } else {
+    // If no page break indicators exist, chunk by paragraph/sections of at most 4,000 chars
+    const sectionChunks = chunkTextBySections(cleanText, 4000);
+    sectionChunks.forEach((sc, idx) => {
+      chunks.push({
+        pageNum: idx + 1,
+        label: sectionChunks.length > 1 ? `Section ${idx + 1}` : `Page 1`,
+        text: sc.text,
+      });
+    });
+  }
+
+  return { fullText: cleanText, chunks, totalPages };
+}
+
+/**
+ * Extract clean text from a DOCX Word document buffer
+ * @param {Buffer} docxBuffer - Raw DOCX buffer
+ * @param {string} filename - Filename for logging
+ */
+async function extractDocxText(docxBuffer, filename = "document.docx") {
+  if (!docxBuffer || !Buffer.isBuffer(docxBuffer) || docxBuffer.length === 0) {
+    throw new Error(`Invalid or empty DOCX buffer for "${filename}".`);
+  }
+
+  let text = "";
+  try {
+    const res = await mammoth.extractRawText({ buffer: docxBuffer });
+    text = (res.value || "").trim();
+  } catch (err) {
+    console.warn(`[Mammoth Extract Warning: ${filename}]`, err.message);
+    // Fallback: inspect word/document.xml inside docx archive
+    try {
+      const zip = new AdmZip(docxBuffer);
+      const docXml = zip.getEntry("word/document.xml");
+      if (docXml) {
+        const rawXml = docXml.getData().toString("utf8");
+        text = rawXml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      }
+    } catch (_) { }
+  }
+
+  const nonWhitespace = text.replace(/\s+/g, "").length;
+  if (nonWhitespace < 20) {
+    throw new Error(`No readable text found in Word document "${filename}".`);
+  }
+
+  const chunks = chunkTextBySections(text, 4000);
+  return { fullText: text, chunks, totalPages: chunks.length };
+}
+
+/**
+ * Extract clean text from a PowerPoint PPTX buffer
+ * @param {Buffer} pptxBuffer - Raw PPTX buffer
+ * @param {string} filename - Filename for logging
+ */
+async function extractPptxText(pptxBuffer, filename = "presentation.pptx") {
+  if (!pptxBuffer || !Buffer.isBuffer(pptxBuffer) || pptxBuffer.length === 0) {
+    throw new Error(`Invalid or empty PPTX buffer for "${filename}".`);
+  }
+
+  try {
+    const zip = new AdmZip(pptxBuffer);
+    const slideEntries = zip.getEntries()
+      .filter((e) => /^ppt\/slides\/slide\d+\.xml$/i.test(e.entryName))
+      .sort((a, b) => {
+        const numA = parseInt(a.entryName.match(/\d+/)?.[0] || "0", 10);
+        const numB = parseInt(b.entryName.match(/\d+/)?.[0] || "0", 10);
+        return numA - numB;
+      });
+
+    if (slideEntries.length === 0) {
+      throw new Error(`No slide content found in PowerPoint presentation "${filename}".`);
+    }
+
+    const chunks = [];
+    let fullText = "";
+
+    for (let i = 0; i < slideEntries.length; i++) {
+      const entry = slideEntries[i];
+      const xml = entry.getData().toString("utf8");
+      const matches = xml.match(/<a:t[^>]*>(.*?)<\/a:t>/gi) || [];
+      const slideText = matches
+        .map((m) => m.replace(/<[^>]+>/g, "").trim())
+        .filter(Boolean)
+        .join(" ");
+
+      if (slideText) {
+        const label = `Slide ${i + 1}`;
+        chunks.push({ pageNum: i + 1, label, text: slideText });
+        fullText += `\n\n--- ${label} ---\n${slideText}`;
+      }
+    }
+
+    const clean = fullText.trim();
+    if (!clean || clean.replace(/\s+/g, "").length < 20) {
+      throw new Error(`No readable text found in PowerPoint "${filename}". Slides may contain only images.`);
+    }
+
+    return { fullText: clean, chunks, totalPages: slideEntries.length };
+  } catch (err) {
+    throw new Error(`Failed to extract text from PPTX "${filename}": ${err.message}`);
+  }
+}
+
+/**
+ * Extract clean, chunked text from a document or ZIP archive
+ * @param {Buffer} buffer - File buffer
+ * @param {string} originalName - Original filename
+ * @param {string} mimeType - MIME type
  * @returns {Promise<{ fullText: string, chunks: Array<{ pageNum: number, label: string, text: string }> }>}
  */
 async function extractDocumentText(buffer, originalName = "", mimeType = "") {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) {
+    throw new Error("Cannot extract text from an empty document buffer.");
+  }
+
   const isZip =
     originalName.toLowerCase().endsWith(".zip") ||
     (buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b);
 
   let fullText = "";
   const chunks = [];
+  const errors = [];
 
   if (isZip) {
+    let zip;
     try {
-      const zip = new AdmZip(buffer);
-      const entries = zip.getEntries().filter((e) => !e.isDirectory);
+      zip = new AdmZip(buffer);
+    } catch (zipErr) {
+      throw new Error(`Failed to read storage archive: ${zipErr.message}`);
+    }
 
-      for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        const cleanName = entry.entryName.replace(/^(\d+_)+/, "");
-        const lowerName = cleanName.toLowerCase();
-        const entryData = entry.getData();
+    const entries = zip.getEntries().filter((e) => !e.isDirectory);
+    if (entries.length === 0) {
+      throw new Error("The uploaded archive contains no files.");
+    }
 
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const cleanName = entry.entryName.replace(/^(\d+_)+/, "");
+      const lowerName = cleanName.toLowerCase();
+      const entryData = entry.getData();
+
+      try {
         if (lowerName.endsWith(".pdf")) {
-          const pdfResult = await extractPdfText(entryData, cleanName);
-          chunks.push(...pdfResult.chunks);
-          fullText += `\n\n--- File: ${cleanName} ---\n${pdfResult.fullText}`;
+          const pdfRes = await extractPdfText(entryData, cleanName);
+          chunks.push(...pdfRes.chunks);
+          fullText += `\n\n--- File: ${cleanName} ---\n${pdfRes.fullText}`;
+        } else if (lowerName.endsWith(".docx") || lowerName.endsWith(".doc")) {
+          const docxRes = await extractDocxText(entryData, cleanName);
+          chunks.push(...docxRes.chunks);
+          fullText += `\n\n--- File: ${cleanName} ---\n${docxRes.fullText}`;
+        } else if (lowerName.endsWith(".pptx")) {
+          const pptxRes = await extractPptxText(entryData, cleanName);
+          chunks.push(...pptxRes.chunks);
+          fullText += `\n\n--- File: ${cleanName} ---\n${pptxRes.fullText}`;
         } else if (
           lowerName.endsWith(".txt") ||
           lowerName.endsWith(".md") ||
           lowerName.endsWith(".json") ||
           lowerName.endsWith(".csv") ||
+          lowerName.endsWith(".log") ||
           lowerName.endsWith(".js") ||
+          lowerName.endsWith(".ts") ||
           lowerName.endsWith(".py") ||
           lowerName.endsWith(".java") ||
           lowerName.endsWith(".c") ||
-          lowerName.endsWith(".cpp")
+          lowerName.endsWith(".cpp") ||
+          lowerName.endsWith(".sql")
         ) {
-          const text = entryData.toString("utf8");
-          chunks.push({
-            pageNum: i + 1,
-            label: cleanName,
-            text,
-          });
-          fullText += `\n\n--- File: ${cleanName} ---\n${text}`;
+          const text = entryData.toString("utf8").trim();
+          if (text) {
+            const fileChunks = chunkTextBySections(text, 4000);
+            fileChunks.forEach((fc) => {
+              chunks.push({
+                pageNum: chunks.length + 1,
+                label: fileChunks.length > 1 ? `${cleanName} (${fc.label})` : cleanName,
+                text: fc.text,
+              });
+            });
+            fullText += `\n\n--- File: ${cleanName} ---\n${text}`;
+          }
         }
+      } catch (err) {
+        console.warn(`[Extraction Warning for ${cleanName}]:`, err.message);
+        errors.push(`${cleanName}: ${err.message}`);
       }
-    } catch (err) {
-      console.warn("[AI Text Extract ZIP Warning]", err.message);
     }
-  } else if (originalName.toLowerCase().endsWith(".pdf") || mimeType.includes("pdf")) {
-    const pdfResult = await extractPdfText(buffer, originalName);
-    chunks.push(...pdfResult.chunks);
-    fullText = pdfResult.fullText;
+
+    if (!fullText.trim()) {
+      const errorDetails = errors.length > 0 ? ` Details: ${errors.join("; ")}` : "";
+      throw new Error(
+        `No readable text could be extracted from archive "${originalName}".${errorDetails} ` +
+        `Please ensure your document contains selectable text.`
+      );
+    }
   } else {
-    // Plain text / Markdown / Source code
-    const rawText = buffer.toString("utf8");
-    fullText = rawText;
-    // Chunk into ~1500-character section blocks
-    const paragraphs = rawText.split(/\n\s*\n/);
-    let currentChunk = "";
-    let chunkIndex = 1;
-
-    for (const para of paragraphs) {
-      if ((currentChunk + "\n" + para).length > 2000 && currentChunk.trim()) {
-        chunks.push({
-          pageNum: chunkIndex,
-          label: `Section ${chunkIndex}`,
-          text: currentChunk.trim(),
-        });
-        chunkIndex++;
-        currentChunk = para;
-      } else {
-        currentChunk += (currentChunk ? "\n\n" : "") + para;
+    // Single non-zip buffer
+    const lowerName = originalName.toLowerCase();
+    if (lowerName.endsWith(".pdf") || mimeType.includes("pdf")) {
+      const pdfRes = await extractPdfText(buffer, originalName);
+      fullText = pdfRes.fullText;
+      chunks.push(...pdfRes.chunks);
+    } else if (lowerName.endsWith(".docx") || lowerName.endsWith(".doc") || mimeType.includes("word")) {
+      const docxRes = await extractDocxText(buffer, originalName);
+      fullText = docxRes.fullText;
+      chunks.push(...docxRes.chunks);
+    } else if (lowerName.endsWith(".pptx") || mimeType.includes("presentation")) {
+      const pptxRes = await extractPptxText(buffer, originalName);
+      fullText = pptxRes.fullText;
+      chunks.push(...pptxRes.chunks);
+    } else {
+      // Plain text or code
+      const text = buffer.toString("utf8").trim();
+      const nonWhitespace = text.replace(/\s+/g, "").length;
+      if (nonWhitespace < 20) {
+        throw new Error(`The document "${originalName}" does not contain sufficient readable text.`);
       }
+      fullText = text;
+      const textChunks = chunkTextBySections(text, 4000);
+      chunks.push(...textChunks);
     }
-    if (currentChunk.trim()) {
-      chunks.push({
-        pageNum: chunkIndex,
-        label: `Section ${chunkIndex}`,
-        text: currentChunk.trim(),
-      });
-    }
-  }
-
-  // Cap full text to ~100k characters for safe context processing
-  if (fullText.length > 120000) {
-    fullText = fullText.slice(0, 120000) + "\n\n[Document truncated for optimal AI processing]";
   }
 
   return { fullText: fullText.trim(), chunks };
 }
 
 /**
- * Extract text from PDF buffer with page number labeling
- */
-async function extractPdfText(pdfBuffer, filename = "document.pdf") {
-  try {
-    const pdfData = await pdfParse(pdfBuffer);
-    const fullText = pdfData.text || "";
-    const totalPages = pdfData.numpages || 1;
-
-    // Approximate page chunks if exact page markers are not separated
-    const chunks = [];
-    const pageStrings = fullText.split(/\f|\n(?=Page\s+\d+)/i);
-
-    if (pageStrings.length > 1) {
-      pageStrings.forEach((pText, idx) => {
-        if (pText.trim()) {
-          chunks.push({
-            pageNum: idx + 1,
-            label: `Page ${idx + 1}`,
-            text: pText.trim(),
-          });
-        }
-      });
-    } else {
-      // Chunk evenly across estimated pages
-      const approxLen = Math.max(1000, Math.ceil(fullText.length / Math.max(1, totalPages)));
-      for (let i = 0; i < totalPages; i++) {
-        const slice = fullText.slice(i * approxLen, (i + 1) * approxLen).trim();
-        if (slice) {
-          chunks.push({
-            pageNum: i + 1,
-            label: `Page ${i + 1}`,
-            text: slice,
-          });
-        }
-      }
-    }
-
-    return { fullText, chunks, totalPages };
-  } catch (err) {
-    console.warn("[PDF Parse Error]", err.message);
-    const rawFallback = pdfBuffer.toString("utf8").replace(/[^\x20-\x7E\n\t]/g, " ");
-    return { fullText: rawFallback, chunks: [{ pageNum: 1, label: "Document", text: rawFallback }] };
-  }
-}
-
-/**
  * Low-level chat completion via Groq Cloud API with automatic TPM limit compliance,
  * intelligent payload reduction, and graceful model fallback.
  */
-async function callGroqChat({ messages, temperature = 0.3, maxTokens = 650, responseFormat = null, retryCount = 0 }) {
+async function callGroqChat({ messages, temperature = 0.25, maxTokens = 750, responseFormat = null, retryCount = 0 }) {
   const apiKey = getGroqApiKey();
   if (!apiKey) {
     throw new Error(
@@ -188,8 +405,7 @@ async function callGroqChat({ messages, temperature = 0.3, maxTokens = 650, resp
     );
   }
 
-  // Ensure maxTokens stays within Groq free-tier OTPM limits (<= 750 tokens)
-  const safeMaxTokens = Math.min(Math.max(parseInt(maxTokens, 10) || 600, 100), 750);
+  const safeMaxTokens = Math.min(Math.max(parseInt(maxTokens, 10) || 1200, 100), 4096);
 
   let lastError = null;
   for (const model of CANDIDATE_MODELS) {
@@ -235,6 +451,19 @@ async function callGroqChat({ messages, temperature = 0.3, maxTokens = 650, resp
       const errMsg = data.error?.message || `Groq API Error on ${model} (${response.status})`;
       lastError = new Error(errMsg);
 
+      // If HTTP 429 rate limit encountered, wait for TPM recovery and retry
+      if (response.status === 429 && retryCount === 0) {
+        console.warn(`[Groq AI 429 Rate Limit] Waiting 2.5s for rate limit recovery on ${model}...`);
+        await new Promise((r) => setTimeout(r, 2500));
+        return await callGroqChat({
+          messages,
+          temperature,
+          maxTokens: safeMaxTokens,
+          responseFormat,
+          retryCount: retryCount + 1,
+        });
+      }
+
       // If TPM or message size limit error detected, dynamically shrink text and retry once
       const isSizeError =
         response.status === 413 ||
@@ -243,16 +472,15 @@ async function callGroqChat({ messages, temperature = 0.3, maxTokens = 650, resp
             errMsg.includes("tokens per minute") ||
             errMsg.includes("TPM") ||
             errMsg.includes("message size") ||
-            errMsg.includes("reduce your message size") ||
-            errMsg.includes("rate limit")));
+            errMsg.includes("reduce your message size")));
 
       if (isSizeError && retryCount === 0) {
-        console.warn(`[Groq AI Auto-Truncation] TPM limit approached. Shrinking message context and retrying...`);
+        console.warn(`[Groq AI Auto-Truncation] TPM limit approached on ${model}. Shrinking message context and retrying...`);
         const reducedMessages = messages.map((m) => {
           if (m.role === "user" && typeof m.content === "string") {
             return {
               ...m,
-              content: m.content.length > 5000 ? m.content.slice(0, 5000) + "\n\n[Content trimmed to fit TPM limits]" : m.content,
+              content: m.content.length > 4500 ? m.content.slice(0, 4500) + "\n\n[Content trimmed to fit TPM limits]" : m.content,
             };
           }
           return m;
@@ -260,7 +488,7 @@ async function callGroqChat({ messages, temperature = 0.3, maxTokens = 650, resp
         return await callGroqChat({
           messages: reducedMessages,
           temperature,
-          maxTokens: Math.min(safeMaxTokens, 450),
+          maxTokens: Math.min(safeMaxTokens, 500),
           responseFormat,
           retryCount: retryCount + 1,
         });
@@ -275,60 +503,147 @@ async function callGroqChat({ messages, temperature = 0.3, maxTokens = 650, resp
 
 /**
  * 1. AI Document Summarizer
- * Generates Executive Summary, Core Key Concepts, and High-Yield Revision Notes
+ * Generates:
+ * - Executive Summary
+ * - Key Concepts & Definitions
+ * - Section-by-Section Revision Notes
+ * - Examples & Applications
+ * - Important Questions & Self-Assessment
+ * - Quick-Revision Takeaways
  */
-async function generateSummary(docId, documentText, docName, mode = "detailed") {
+async function generateSummary(docId, documentText, docName, mode = "detailed", refresh = false) {
   const cacheKey = `${docId}_${mode}`;
-  if (summaryCache.has(cacheKey)) {
+  if (!refresh && summaryCache.has(cacheKey)) {
     return summaryCache.get(cacheKey);
   }
 
-  const systemPrompt = `You are DocQevrilo AI, an expert academic and technical study assistant.
-Your task is to analyze the document text and provide a high-yield, beautifully structured summary.
+  // Split the document into thorough sections (~2,500 characters each)
+  const sectionChunks = chunkTextBySections(documentText, 2500);
+  console.log(`[AI Summarizer] Document "${docName}" (${documentText.length} chars) divided into ${sectionChunks.length} sections.`);
 
-Structure your response with clear Markdown headings:
+  let structuredSummary = "";
+
+  if (sectionChunks.length === 1) {
+    // Single-section document: extract ALL concepts, terms, idioms with max completeness
+    const singlePrompt = `Document: "${docName}"
+Study Format: ${mode}
+
+Extracted Document Content:
+"""
+${documentText}
+"""
+
+CRITICAL COMPLETENESS MANDATE:
+1. Extract and list EVERY distinct item, definition, idiom, formula, term, and fact found in this text.
+2. If there are multiple items, idioms, or terms (e.g. 5, 10, 20, 40), list and explain ALL of them without skipping or omitting any.
+3. DO NOT abbreviate, truncate, or summarize lists by mentioning only a few examples. Include all items.
+4. Preserve the exact terms, original idiom, clear definitions, and illustrative examples.
+
+Please produce the comprehensive study guide with these sections:
+# Comprehensive Study Guide: ${docName}
+
 ## 📌 Executive Summary
-A concise overview explaining the core purpose and key points in 1-2 paragraphs.
+Provide an authoritative overview of the document's purpose, background, and core themes.
 
-## 🔑 Key Concepts & Definitions
-- **Concept Name**: Clear definition and significance.
-(Highlight 3-5 crucial concepts)
+## 🔑 Complete Catalog of Key Concepts, Definitions & Idioms
+List and explain EVERY SINGLE term, concept, or idiom in full:
+- **[Term / Idiom / Concept]**: Meaning / Definition.
+  - *Context / Usage / Example*: (provide illustrative sentence or example)
 
-## 📋 High-Yield Revision Notes
-- Important takeaways, principles, or critical workflows.
+## 📖 In-Depth Detailed Notes
+Systematic breakdown of the document's topics, structure, and lessons.
 
-## 💡 Practical Takeaways
-Brief bullet points summarizing practical applications.
+## 💡 Examples & Practical Applications
+Concrete scenarios, sentences, or use cases mentioned.
 
-Be concise, accurate, and easy to read. Base all insights strictly on the provided document text.`;
+## ❓ High-Yield Self-Assessment Questions
+5 rigorous questions directly assessing mastery of the document.
 
-  // Maximum safe character slice to stay comfortably below 8,000 TPM
-  const maxChars = mode === "quick" ? 6000 : 9000;
-  const safeText = (documentText || "").slice(0, maxChars);
+## ⚡ Quick-Revision Key Takeaways
+Key summary points for rapid revision.`;
 
-  const userPrompt = `Document Name: "${docName}"
-Format Mode: ${mode}
+    structuredSummary = await callGroqChat({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an exhaustive academic study assistant. " +
+            "Completeness is strictly mandatory. Never omit, truncate, or summarize distinct list items, idioms, or definitions."
+        },
+        { role: "user", content: singlePrompt },
+      ],
+      temperature: 0.1,
+      maxTokens: 3500,
+    });
+  } else {
+    // Multi-section document: process EVERY chunk sequentially to guarantee full document coverage
+    const chunkSummaries = [];
+    console.log(`[AI Long Document] Processing all ${sectionChunks.length} sections for "${docName}"...`);
 
-Document Content:
+    for (let i = 0; i < sectionChunks.length; i++) {
+      const chunk = sectionChunks[i];
+      console.log(`[AI Full Summary] Summarizing section ${i + 1}/${sectionChunks.length} for "${docName}"...`);
+
+      const chunkPrompt = `
+Document: "${docName}"
+Section: ${i + 1} of ${sectionChunks.length}
+
+Analyze the following document section carefully and extract exhaustive study notes.
+
+CRITICAL COMPLETENESS RULES:
+1. Cover EVERY distinct item, idiom, definition, example, rule, and fact in this section.
+2. If this section has 5, 10, or 20 idioms or terms, list and explain ALL of them.
+3. Do NOT summarize lists by mentioning only a few examples. Never use "etc." or skip items.
+4. Preserve the exact terms, original idiom, clear definitions, and illustrative examples.
+5. Maintain the document's original order.
+
+DOCUMENT SECTION CONTENT:
 """
-${safeText}
+${chunk.text}
 """
 
-Please generate the structured summary.`;
+Return thorough, complete, and well-formatted study notes for this section.
+`;
 
-  const maxTokens = mode === "quick" ? 400 : mode === "exam" ? 600 : 650;
+      const result = await callGroqChat({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an exhaustive academic document extractor. " +
+              "Completeness is strictly mandatory. Never omit or skip distinct items, idioms, or definitions."
+          },
+          { role: "user", content: chunkPrompt },
+        ],
+        temperature: 0.1,
+        maxTokens: 2000,
+      });
 
-  const result = await callGroqChat({
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    temperature: 0.25,
-    maxTokens,
-  });
+      chunkSummaries.push(`## Section ${i + 1} Notes (${chunk.label || `Part ${i + 1}`})\n${result}`);
+
+      // Delay between requests to respect Groq rate limits
+      if (i < sectionChunks.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+    }
+
+    structuredSummary = `
+# Comprehensive Full-Document Study Guide: ${docName}
+
+## 📌 Executive Summary
+This comprehensive study guide covers all ${sectionChunks.length} processed sections of "${docName}".
+Every concept, definition, idiom, fact, and example extracted across the entire document is cataloged below without omissions.
+
+${chunkSummaries.join("\n\n")}
+
+## ⚡ Quick-Revision Takeaways
+- Complete coverage achieved across all ${sectionChunks.length} sections of the document.
+- Review each section's comprehensive catalog above for exam, interview, and study revision.
+`;
+  }
 
   const output = {
-    summary: result,
+    summary: structuredSummary,
     model: lastSuccessfulModel || ACTIVE_MODEL,
     generatedAt: new Date().toISOString(),
   };
@@ -341,44 +656,57 @@ Please generate the structured summary.`;
  * 2. Ask AI - Context-Aware Q&A with Citations
  */
 async function answerQuestion(docId, documentText, chunks, question, history = []) {
-  // Build indexed context with section/page markers for citation, strictly capped to ~8000 chars
-  const selectedChunks = (Array.isArray(chunks) && chunks.length > 0) ? chunks.slice(0, 6) : [];
-  let contextSections = selectedChunks
-    .map((c) => `[Source: ${c.label}]\n${(c.text || "").slice(0, 1200)}`)
-    .join("\n\n---\n\n");
+  // Rank and select the most relevant chunks based on keyword matching
+  let selectedText = "";
+  if (Array.isArray(chunks) && chunks.length > 0) {
+    const qWords = question.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+    // Score each chunk by keyword overlap
+    const scored = chunks.map((c) => {
+      const textLower = (c.text || "").toLowerCase();
+      let score = 0;
+      for (const w of qWords) {
+        if (textLower.includes(w)) score += 1;
+      }
+      return { chunk: c, score };
+    });
 
-  if (!contextSections && documentText) {
-    contextSections = documentText.slice(0, 8000);
-  } else if (contextSections.length > 8000) {
-    contextSections = contextSections.slice(0, 8000);
+    scored.sort((a, b) => b.score - a.score);
+    const topChunks = scored.slice(0, 5).map((s) => s.chunk);
+
+    selectedText = topChunks
+      .map((c) => `[Source: ${c.label}]\n${(c.text || "").slice(0, 1500)}`)
+      .join("\n\n---\n\n");
   }
 
-  const systemPrompt = `You are DocQevrilo AI, an expert document assistant for students and professionals.
-You have access to the document excerpt below with Source tags like [Source: Page 1] or [Source: Section 2].
+  if (!selectedText) {
+    selectedText = (documentText || "").slice(0, 8000);
+  }
+
+  const systemPrompt = `You are DocQevrilo AI, an expert document tutor.
+You have access to the document excerpt below with Source markers like [Source: Page 1] or [Source: Slide 2].
 
 Guidelines:
-1. Answer the question accurately and concisely based on the text.
-2. Whenever referencing a fact, definition, or explanation, ALWAYS cite the source in bold: **[Page X]** or **[Section Y]**.
-3. If the question cannot be answered from the document, politely state that it's not mentioned.`;
+1. Answer the question accurately and concisely based strictly on the provided document text.
+2. ALWAYS cite the exact source in bold: **[Page X]** or **[Slide Y]** or **[Section Z]** for every fact mentioned.
+3. If the answer cannot be found in the provided document excerpt, clearly and politely state: "This information is not mentioned in the uploaded document." Do NOT invent or hallucinate answers.`;
 
   const conversation = [
     { role: "system", content: systemPrompt },
     {
       role: "user",
-      content: `Here is the reference document content:\n"""\n${contextSections}\n"""`,
+      content: `Reference Document Excerpt:\n"""\n${selectedText}\n"""`,
     },
     {
       role: "assistant",
-      content: "I have read and analyzed your document. What would you like to know or clarify?",
+      content: "I have read and indexed the document excerpt. I am ready to answer your questions with citations.",
     },
   ];
 
-  // Append recent conversational history (up to last 4 messages to save tokens)
   if (Array.isArray(history) && history.length > 0) {
-    const recentHistory = history.slice(-4);
-    for (const msg of recentHistory) {
+    const recent = history.slice(-4);
+    for (const msg of recent) {
       if (msg.role && msg.content) {
-        conversation.push({ role: msg.role, content: String(msg.content).slice(0, 500) });
+        conversation.push({ role: msg.role, content: String(msg.content).slice(0, 400) });
       }
     }
   }
@@ -387,8 +715,8 @@ Guidelines:
 
   const answer = await callGroqChat({
     messages: conversation,
-    temperature: 0.3,
-    maxTokens: 550,
+    temperature: 0.25,
+    maxTokens: 600,
   });
 
   return {
@@ -417,8 +745,8 @@ Target Topic: "${topic}"
 Difficulty Level: "${difficulty}"
 
 Requirements:
-1. Return ONLY a valid JSON array of objects without Markdown formatting or prose.
-2. Each question object MUST have:
+1. Return ONLY a valid JSON array of objects without Markdown code fences, prose, or explanations outside the JSON.
+2. Each question object MUST contain:
    - "id": number (1 to ${count})
    - "question": string
    - "options": array of exactly 4 strings
@@ -426,23 +754,35 @@ Requirements:
    - "explanation": string
    - "citation": string
 
-Schema:
-[{"id":1,"question":"...","options":["A","B","C","D"],"correctIndex":0,"explanation":"...","citation":"..."}]`;
+Example JSON:
+[{"id":1,"question":"...","options":["A","B","C","D"],"correctIndex":0,"explanation":"...","citation":"Page 1"}]`;
+
+  let quizContext = documentText || "";
+  if (quizContext.length > 7000) {
+    // Sample evenly across all sections of the document so the quiz tests the entire document
+    const sectionChunks = chunkTextBySections(quizContext, 2000);
+    const sampled = [];
+    const step = Math.max(1, Math.floor(sectionChunks.length / Math.min(count, sectionChunks.length)));
+    for (let i = 0; i < sectionChunks.length && sampled.length < count; i += step) {
+      sampled.push(`[Section ${i + 1} Excerpt]:\n${sectionChunks[i].text.slice(0, 1200)}`);
+    }
+    quizContext = sampled.join("\n\n");
+  }
 
   const userPrompt = `Document Content:
 """
-${(documentText || "").slice(0, 8500)}
+${quizContext}
 """
 
-Generate ${count} ${difficulty} MCQs in JSON format.`;
+Generate ${count} ${difficulty} MCQs in JSON format testing across the provided content.`;
 
   const rawJson = await callGroqChat({
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ],
-    temperature: 0.3,
-    maxTokens: 700,
+    temperature: 0.25,
+    maxTokens: 800,
   });
 
   let questions = [];
@@ -467,7 +807,6 @@ Generate ${count} ${difficulty} MCQs in JSON format.`;
   return result;
 }
 
-
 module.exports = {
   extractDocumentText,
   generateSummary,
@@ -475,4 +814,6 @@ module.exports = {
   generateQuiz,
   getGroqApiKey,
   textCache,
+  summaryCache,
+  quizCache,
 };

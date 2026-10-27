@@ -11,6 +11,8 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const archiverPkg = require("archiver");
 const AdmZip = require("adm-zip");
+const mammoth = require("mammoth");
+const XLSX = require("xlsx");
 function createZipArchive(options = { zlib: { level: 0 } }) {
   if (typeof archiverPkg === "function") {
     return archiverPkg("zip", options);
@@ -61,6 +63,7 @@ const {
   generateQuiz,
   getGroqApiKey,
   textCache,
+  summaryCache,
 } = require("./aiService");
 const {
   isB2Configured,
@@ -89,7 +92,8 @@ app.use(
     crossOriginResourcePolicy: { policy: "cross-origin" },
     crossOriginEmbedderPolicy: false,
     crossOriginOpenerPolicy: false,
-    frameguard: false
+    frameguard: false,
+    xDownloadOptions: false
   })
 );
 
@@ -873,7 +877,18 @@ function getMimeType(filename, defaultMime = "application/octet-stream") {
   if (!filename) return defaultMime;
   const ext = path.extname(filename).toLowerCase();
   const mimeMap = {
+    // Documents
     ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".rtf": "application/rtf",
+    // Images
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -882,6 +897,10 @@ function getMimeType(filename, defaultMime = "application/octet-stream") {
     ".svg": "image/svg+xml",
     ".bmp": "image/bmp",
     ".ico": "image/x-icon",
+    ".avif": "image/avif",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    // Text & Code
     ".txt": "text/plain; charset=utf-8",
     ".md": "text/markdown; charset=utf-8",
     ".json": "application/json; charset=utf-8",
@@ -890,16 +909,60 @@ function getMimeType(filename, defaultMime = "application/octet-stream") {
     ".html": "text/html; charset=utf-8",
     ".htm": "text/html; charset=utf-8",
     ".xml": "application/xml; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
+    ".js": "text/plain; charset=utf-8",
+    ".mjs": "text/plain; charset=utf-8",
+    ".cjs": "text/plain; charset=utf-8",
+    ".ts": "text/plain; charset=utf-8",
+    ".tsx": "text/plain; charset=utf-8",
+    ".jsx": "text/plain; charset=utf-8",
     ".css": "text/css; charset=utf-8",
+    ".py": "text/plain; charset=utf-8",
+    ".java": "text/plain; charset=utf-8",
+    ".c": "text/plain; charset=utf-8",
+    ".cpp": "text/plain; charset=utf-8",
+    ".h": "text/plain; charset=utf-8",
+    ".hpp": "text/plain; charset=utf-8",
+    ".cs": "text/plain; charset=utf-8",
+    ".sql": "text/plain; charset=utf-8",
+    ".sh": "text/plain; charset=utf-8",
+    ".bash": "text/plain; charset=utf-8",
+    ".bat": "text/plain; charset=utf-8",
+    ".ps1": "text/plain; charset=utf-8",
+    ".yaml": "text/plain; charset=utf-8",
+    ".yml": "text/plain; charset=utf-8",
+    ".toml": "text/plain; charset=utf-8",
+    ".ini": "text/plain; charset=utf-8",
+    ".env": "text/plain; charset=utf-8",
+    // Audio & Video
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
     ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
     ".mp4": "video/mp4",
     ".webm": "video/webm",
     ".zip": "application/zip",
   };
-  return mimeMap[ext] || defaultMime;
+
+  if (mimeMap[ext]) {
+    return mimeMap[ext];
+  }
+
+  if (!defaultMime || defaultMime === "application/zip") {
+    return "application/octet-stream";
+  }
+  return defaultMime;
+}
+
+function isBrowserNativelyViewable(filename) {
+  if (!filename) return false;
+  const ext = path.extname(filename).toLowerCase();
+  return [
+    ".pdf",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif",
+    ".mp3", ".wav", ".ogg", ".m4a",
+    ".mp4", ".webm",
+    ".html", ".htm"
+  ].includes(ext);
 }
 
 function escapeHtml(str) {
@@ -918,6 +981,525 @@ function formatBytesServer(bytes) {
   const sizes = ["Bytes", "KB", "MB", "GB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
+// In-Browser Document Viewer for DOCX, TXT, MD, Code
+function renderDocumentViewerHtml({ filename, contentHtml, downloadUrl, isCode = false, codeLang = "" }) {
+  const ext = path.extname(filename).toLowerCase();
+  let icon = "📄";
+  let typeLabel = "Document";
+  if ([".docx", ".doc"].includes(ext)) {
+    icon = "📘";
+    typeLabel = "Word Document";
+  } else if ([".xlsx", ".xls", ".csv"].includes(ext)) {
+    icon = "📊";
+    typeLabel = "Spreadsheet";
+  } else if ([".txt", ".md", ".log"].includes(ext)) {
+    icon = "📝";
+    typeLabel = "Text Document";
+  } else if ([".js", ".ts", ".py", ".java", ".c", ".cpp", ".css", ".html", ".json", ".sql", ".sh"].includes(ext)) {
+    icon = "💻";
+    typeLabel = `${ext.replace(".", "").toUpperCase()} Code`;
+  }
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(filename)} — Document Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #09090B;
+      --card-bg: #121215;
+      --paper-bg: #18181B;
+      --border: #27272A;
+      --text: #F4F4F5;
+      --text-muted: #A1A1AA;
+      --accent: #E11D2E;
+      --accent-hover: #FF2E44;
+      --doc-text: #E4E4E7;
+      --doc-heading: #FFFFFF;
+      --table-border: #3F3F46;
+      --table-header-bg: #1F1F23;
+    }
+    body.paper-mode {
+      --bg: #F4F4F5;
+      --card-bg: #FFFFFF;
+      --paper-bg: #FFFFFF;
+      --border: #E4E4E7;
+      --text: #18181B;
+      --text-muted: #71717A;
+      --doc-text: #27272A;
+      --doc-heading: #09090B;
+      --table-border: #D4D4D8;
+      --table-header-bg: #F4F4F5;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      line-height: 1.6;
+      transition: background 0.2s, color 0.2s;
+    }
+    .top-bar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      backdrop-filter: blur(10px);
+    }
+    .file-meta {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .file-icon {
+      font-size: 20px;
+      flex-shrink: 0;
+    }
+    .file-details {
+      min-width: 0;
+    }
+    .file-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--text-muted);
+      margin-top: 1px;
+    }
+    .file-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .btn {
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 11px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      text-decoration: none;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      border: 1px solid transparent;
+    }
+    .btn-secondary {
+      background: var(--paper-bg);
+      border-color: var(--border);
+      color: var(--text);
+    }
+    .btn-secondary:hover {
+      border-color: #52525B;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #FFFFFF;
+    }
+    .btn-primary:hover {
+      background: var(--accent-hover);
+    }
+    .viewer-container {
+      flex: 1;
+      width: 100%;
+      max-width: 900px;
+      margin: 20px auto;
+      padding: 0 16px;
+    }
+    .document-paper {
+      background: var(--paper-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 28px 24px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+      color: var(--doc-text);
+      font-size: 14px;
+      overflow-wrap: break-word;
+      word-wrap: break-word;
+    }
+    @media (min-width: 640px) {
+      .document-paper { padding: 44px 48px; }
+    }
+    .document-paper h1, .document-paper h2, .document-paper h3, .document-paper h4, .document-paper h5, .document-paper h6 {
+      color: var(--doc-heading);
+      margin-top: 24px;
+      margin-bottom: 12px;
+      font-weight: 700;
+      line-height: 1.3;
+    }
+    .document-paper h1:first-child, .document-paper h2:first-child { margin-top: 0; }
+    .document-paper p {
+      margin-bottom: 14px;
+    }
+    .document-paper ol, .document-paper ul {
+      margin-bottom: 16px;
+      padding-left: 24px;
+    }
+    .document-paper li {
+      margin-bottom: 6px;
+    }
+    .document-paper strong, .document-paper b {
+      color: var(--doc-heading);
+      font-weight: 600;
+    }
+    .document-paper blockquote {
+      border-left: 3px solid var(--accent);
+      padding-left: 14px;
+      margin: 16px 0;
+      color: var(--text-muted);
+      font-style: italic;
+    }
+    .document-paper table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 18px 0;
+      font-size: 13px;
+    }
+    .document-paper th, .document-paper td {
+      border: 1px solid var(--table-border);
+      padding: 8px 12px;
+      text-align: left;
+    }
+    .document-paper th {
+      background: var(--table-header-bg);
+      font-weight: 600;
+      color: var(--doc-heading);
+    }
+    .document-paper pre, .code-container {
+      background: #0B0B0D;
+      color: #E4E4E7;
+      border: 1px solid #27272A;
+      border-radius: 8px;
+      padding: 16px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      margin: 16px 0;
+      white-space: pre-wrap;
+    }
+    @media print {
+      .top-bar { display: none !important; }
+      body { background: #FFFFFF !important; color: #000000 !important; }
+      .viewer-container { max-width: 100% !important; margin: 0 !important; padding: 0 !important; }
+      .document-paper { border: none !important; box-shadow: none !important; padding: 0 !important; color: #000000 !important; background: transparent !important; }
+      .document-paper h1, .document-paper h2, .document-paper h3, .document-paper strong { color: #000000 !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="top-bar">
+    <div class="file-meta">
+      <span class="file-icon">${icon}</span>
+      <div class="file-details">
+        <div class="file-title" title="${escapeHtml(filename)}">${escapeHtml(filename)}</div>
+        <div class="file-badge">${typeLabel} · In-Browser Native View</div>
+      </div>
+    </div>
+    <div class="file-actions">
+      <button type="button" class="btn btn-secondary" onclick="document.body.classList.toggle('paper-mode')" title="Toggle light/paper reading mode">
+        🌗 Theme
+      </button>
+      <button type="button" class="btn btn-secondary" onclick="window.print()" title="Print or save as PDF">
+        🖨️ Print
+      </button>
+      <a href="${downloadUrl}" class="btn btn-primary" title="Download original file">
+        ⬇️ Download
+      </a>
+    </div>
+  </div>
+
+  <div class="viewer-container">
+    <div class="document-paper">
+      ${contentHtml}
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+// In-Browser Spreadsheet Viewer for XLSX, XLS
+function renderSheetViewerHtml({ filename, sheetHtml, downloadUrl }) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(filename)} — Spreadsheet Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #09090B;
+      color: #FAFAFA;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .top-bar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: #18181B;
+      border-bottom: 1px solid #27272A;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .file-meta {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .file-icon { font-size: 20px; }
+    .file-title {
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-badge { font-size: 10px; color: #A1A1AA; }
+    .file-actions { display: flex; align-items: center; gap: 8px; }
+    .btn {
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 11px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      text-decoration: none;
+      cursor: pointer;
+      border: 1px solid transparent;
+    }
+    .btn-secondary { background: #27272A; color: #FAFAFA; border-color: #3F3F46; }
+    .btn-primary { background: #E11D2E; color: #FFFFFF; }
+    .btn-primary:hover { background: #FF2E44; }
+    .table-container {
+      flex: 1;
+      padding: 16px;
+      overflow: auto;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      min-width: 600px;
+      background: #121215;
+      border: 1px solid #27272A;
+      border-radius: 8px;
+      overflow: hidden;
+      font-size: 12px;
+    }
+    th, td {
+      border: 1px solid #27272A;
+      padding: 8px 12px;
+      text-align: left;
+    }
+    th {
+      background: #1F1F23;
+      font-weight: 600;
+      color: #FFFFFF;
+      position: sticky;
+      top: 0;
+    }
+    tr:nth-child(even) td { background: #16161A; }
+    tr:hover td { background: #222228; }
+  </style>
+</head>
+<body>
+  <div class="top-bar">
+    <div class="file-meta">
+      <span class="file-icon">📊</span>
+      <div class="file-details">
+        <div class="file-title" title="${escapeHtml(filename)}">${escapeHtml(filename)}</div>
+        <div class="file-badge">Spreadsheet · In-Browser Table View</div>
+      </div>
+    </div>
+    <div class="file-actions">
+      <button type="button" class="btn btn-secondary" onclick="window.print()">🖨️ Print</button>
+      <a href="${downloadUrl}" class="btn btn-primary">⬇️ Download</a>
+    </div>
+  </div>
+  <div class="table-container">
+    ${sheetHtml}
+  </div>
+</body>
+</html>`;
+}
+
+// Fallback HTML for unviewable binary formats
+function renderBinaryFallbackHtml({ filename, fileSize, downloadUrl }) {
+  const sizeStr = formatBytesServer(fileSize || 0);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(filename)} — File Preview</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #09090B;
+      color: #FAFAFA;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      background: #18181B;
+      border: 1px solid #27272A;
+      border-radius: 14px;
+      max-width: 440px;
+      width: 100%;
+      padding: 32px 24px;
+      text-align: center;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .icon { font-size: 48px; margin-bottom: 16px; }
+    h2 { font-size: 16px; font-weight: 600; margin-bottom: 8px; word-break: break-all; }
+    p { font-size: 12px; color: #A1A1AA; margin-bottom: 24px; line-height: 1.5; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: #E11D2E;
+      color: #fff;
+      padding: 10px 20px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+      transition: background 0.15s;
+    }
+    .btn:hover { background: #FF2E44; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">📦</div>
+    <h2>${escapeHtml(filename)}</h2>
+    <p>This binary archive (${sizeStr}) requires an external application on your device. Click below to download and open it.</p>
+    <a href="${downloadUrl}" class="btn">⬇️ Download File (${sizeStr})</a>
+  </div>
+</body>
+</html>`;
+}
+
+// Helper to send uncompressed file data to browser viewer without triggering unexpected download
+async function sendFileToViewer(cleanName, data, downloadUrl, res) {
+  const ext = path.extname(cleanName).toLowerCase();
+
+  // 1. Word Documents (.docx, .doc)
+  if ([".docx", ".doc"].includes(ext)) {
+    try {
+      const { value: html } = await mammoth.convertToHtml({ buffer: data });
+      const content = html && html.trim() ? html : `<p><em>(Document appears to be empty or has no readable text content.)</em></p>`;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      return res.send(renderDocumentViewerHtml({ filename: cleanName, contentHtml: content, downloadUrl }));
+    } catch (docxErr) {
+      console.warn("[Mammoth Convert Warning]", docxErr.message);
+      try {
+        const docxZip = new AdmZip(data);
+        const docXml = docxZip.getEntry("word/document.xml");
+        if (docXml) {
+          const rawXml = docXml.getData().toString("utf8");
+          const plainText = rawXml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          return res.send(renderDocumentViewerHtml({
+            filename: cleanName,
+            contentHtml: `<div class="code-container">${escapeHtml(plainText)}</div>`,
+            downloadUrl
+          }));
+        }
+      } catch (_) {}
+    }
+  }
+
+  // 2. Spreadsheets (.xlsx, .xls)
+  if ([".xlsx", ".xls"].includes(ext)) {
+    try {
+      const workbook = XLSX.read(data, { type: "buffer" });
+      const firstSheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[firstSheetName];
+      const tableHtml = XLSX.utils.sheet_to_html(sheet);
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      return res.send(renderSheetViewerHtml({ filename: cleanName, sheetHtml: tableHtml, downloadUrl }));
+    } catch (sheetErr) {
+      console.warn("[XLSX Convert Warning]", sheetErr.message);
+    }
+  }
+
+  // 3. Text and Source Code
+  const isTextOrCode = [
+    ".txt", ".md", ".json", ".log", ".csv", ".js", ".mjs", ".cjs", ".ts",
+    ".jsx", ".tsx", ".py", ".java", ".c", ".cpp", ".h", ".hpp", ".cs",
+    ".css", ".sql", ".sh", ".bash", ".bat", ".ps1", ".yaml", ".yml",
+    ".toml", ".ini", ".env", ".xml"
+  ].includes(ext);
+
+  if (isTextOrCode) {
+    const textContent = data.toString("utf8");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    return res.send(renderDocumentViewerHtml({
+      filename: cleanName,
+      contentHtml: `<pre class="code-container"><code>${escapeHtml(textContent)}</code></pre>`,
+      downloadUrl,
+      isCode: true,
+      codeLang: ext.replace(".", "")
+    }));
+  }
+
+  // 4. Native Browser Viewable (PDF, Images, Audio, Video, HTML)
+  if (isBrowserNativelyViewable(cleanName)) {
+    const mimeType = getMimeType(cleanName);
+    const safeFilename = path.basename(cleanName).replace(/["\r\n]/g, "_");
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Disposition", `inline; filename="${safeFilename}"`);
+    res.setHeader("Content-Length", String(data.length));
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    return res.send(data);
+  }
+
+  // 5. Other binary formats (e.g. .exe, .bin, .iso, .zip)
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  return res.send(renderBinaryFallbackHtml({ filename: cleanName, fileSize: data.length, downloadUrl }));
 }
 
 // Render responsive HTML viewer for multi-file archives
@@ -1267,6 +1849,18 @@ async function streamDocumentToResponse(doc, req, res) {
 
       const entries = zip ? zip.getEntries().filter((e) => !e.isDirectory) : [];
 
+      const codeParam = encodeURIComponent(req.params.access_code || req.query.code || doc.access_code || "");
+      const token = (req.query && (req.query.token || req.query.auth_token)) ? (req.query.token || req.query.auth_token) : "";
+      const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
+      const isOwnerRoute = req.path.includes("/owner/") || (!codeParam && doc.id);
+
+      const getFileDownloadUrl = (entryName = null) => {
+        if (isOwnerRoute) {
+          return `/api/documents/owner/${doc.id}/download?${entryName ? `file=${encodeURIComponent(entryName)}&` : ""}action=download${tokenQuery}`;
+        }
+        return `/api/documents/download/${codeParam}?action=download${entryName ? `&file=${encodeURIComponent(entryName)}` : ""}`;
+      };
+
       // 1. User wants to view or download a specific file from the archive
       const requestedFile = req.query.file;
       if (requestedFile && entries.length > 0) {
@@ -1277,50 +1871,42 @@ async function streamDocumentToResponse(doc, req, res) {
         );
         if (targetEntry) {
           const cleanName = targetEntry.entryName.replace(/^(\d+_)+/, "");
-          const mimeType = getMimeType(cleanName);
           const data = targetEntry.getData();
-          const disposition = isViewAction ? "inline" : "attachment";
-
-          res.setHeader("Content-Type", mimeType);
-          res.setHeader(
-            "Content-Disposition",
-            `${disposition}; filename="${cleanName}"; filename*=UTF-8''${encodeURIComponent(cleanName)}`
-          );
-          res.setHeader("Content-Length", String(data.length));
-          res.setHeader("X-Content-Type-Options", "nosniff");
 
           if (!isViewAction) {
+            const mimeType = getMimeType(cleanName);
+            res.setHeader("Content-Type", mimeType);
+            res.setHeader(
+              "Content-Disposition",
+              `attachment; filename="${cleanName}"; filename*=UTF-8''${encodeURIComponent(cleanName)}`
+            );
+            res.setHeader("Content-Length", String(data.length));
+            res.setHeader("X-Content-Type-Options", "nosniff");
             downloadCompleted = true;
             res.removeListener("close", cleanupOnClose);
             await finalizeDownload(doc.id);
             if (doc.delete_after_download) {
               setImmediate(() => { purgeExpiredDocuments().catch(() => {}); });
             }
+            return res.send(data);
           } else {
             await incrementViewCount(doc.id);
+            const downloadUrl = getFileDownloadUrl(targetEntry.entryName);
+            return await sendFileToViewer(cleanName, data, downloadUrl, res);
           }
-          return res.send(data);
         }
       }
 
-      // 2. Single-file archive (e.g. uploaded single PDF, image, text note, etc.)
+      // 2. Single-file archive (e.g. uploaded single PDF, image, text note, docx, etc.)
       if (entries.length === 1) {
         const entry = entries[0];
         const cleanName = entry.entryName.replace(/^(\d+_)+/, "");
-        const mimeType = getMimeType(cleanName, doc.mime_type || "application/octet-stream");
         const data = entry.getData();
 
         if (isViewAction) {
-          // Serve uncompressed data with its actual MIME type for native browser rendering
-          res.setHeader("Content-Type", mimeType);
-          res.setHeader(
-            "Content-Disposition",
-            `inline; filename="${cleanName}"; filename*=UTF-8''${encodeURIComponent(cleanName)}`
-          );
-          res.setHeader("Content-Length", String(data.length));
-          res.setHeader("X-Content-Type-Options", "nosniff");
           await incrementViewCount(doc.id);
-          return res.send(data);
+          const downloadUrl = getFileDownloadUrl(entry.entryName);
+          return await sendFileToViewer(cleanName, data, downloadUrl, res);
         } else {
           // Download action
           downloadCompleted = true;
@@ -1332,6 +1918,7 @@ async function streamDocumentToResponse(doc, req, res) {
 
           // If raw ZIP was not explicitly requested, download the real uncompressed file
           if (req.query.format !== "zip") {
+            const mimeType = getMimeType(cleanName, doc.mime_type || "application/octet-stream");
             res.setHeader("Content-Type", mimeType);
             res.setHeader(
               "Content-Disposition",
@@ -1346,39 +1933,42 @@ async function streamDocumentToResponse(doc, req, res) {
       // 3. Multi-file archive view: Render interactive file browser page
       if (entries.length > 1 && isViewAction) {
         await incrementViewCount(doc.id);
-        const codeParam = encodeURIComponent(req.params.access_code || req.query.code || "");
+        const codeParamStr = encodeURIComponent(req.params.access_code || req.query.code || "");
         res.setHeader("Content-Type", "text/html; charset=utf-8");
-        return res.send(renderArchiveViewerHtml(doc, entries, codeParam, req));
+        return res.send(renderArchiveViewerHtml(doc, entries, codeParamStr, req));
       }
     }
 
     // Default streaming for raw storage or full archive download
-    const dispositionType = isViewAction ? "inline" : "attachment";
     const safeFilename = path.basename(doc.original_name).replace(/["\r\n]/g, "_");
-    const mimeType = isViewAction
-      ? getMimeType(doc.original_name, doc.mime_type || "application/octet-stream")
-      : doc.mime_type || "application/octet-stream";
+    const codeParam = encodeURIComponent(req.params.access_code || req.query.code || doc.access_code || "");
+    const token = (req.query && (req.query.token || req.query.auth_token)) ? (req.query.token || req.query.auth_token) : "";
+    const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
+    const isOwnerRoute = req.path.includes("/owner/") || (!codeParam && doc.id);
+    const downloadUrl = isOwnerRoute
+      ? `/api/documents/owner/${doc.id}/download?action=download${tokenQuery}`
+      : `/api/documents/download/${codeParam}?action=download`;
 
-    res.setHeader("Content-Type", mimeType);
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader(
-      "Content-Disposition",
-      `${dispositionType}; filename="${safeFilename}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`
-    );
-    res.setHeader("Content-Length", String(buffer.length));
-
-    if (!isViewAction) {
+    if (isViewAction) {
+      await incrementViewCount(doc.id);
+      return await sendFileToViewer(doc.original_name, buffer, downloadUrl, res);
+    } else {
       downloadCompleted = true;
       res.removeListener("close", cleanupOnClose);
       await finalizeDownload(doc.id);
       if (doc.delete_after_download) {
         setImmediate(() => { purgeExpiredDocuments().catch(() => {}); });
       }
-    } else {
-      await incrementViewCount(doc.id);
+      const mimeType = doc.mime_type || getMimeType(doc.original_name);
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`
+      );
+      res.setHeader("Content-Length", String(buffer.length));
+      return res.send(buffer);
     }
-
-    return res.send(buffer);
   } catch (err) {
     if (!isViewAction && !downloadCompleted) {
       await releaseDownloadReservation(doc.id).catch(() => {});
@@ -2163,8 +2753,8 @@ async function resolveDocumentForAi(docId, req) {
 }
 
 // Helper: Retrieve and extract document text buffer
-async function getDocumentExtractedText(doc) {
-  if (textCache.has(doc.id)) {
+async function getDocumentExtractedText(doc, refresh = false) {
+  if (!refresh && textCache.has(doc.id)) {
     return textCache.get(doc.id);
   }
 
@@ -2209,7 +2799,14 @@ app.post("/api/ai/documents/:id/summary", optionalAuth, accessLimiter, async (re
   try {
     const doc = await resolveDocumentForAi(req.params.id, req);
     const mode = req.body?.mode || "detailed"; // 'detailed' | 'quick' | 'exam'
-    const { fullText } = await getDocumentExtractedText(doc);
+    const refresh = Boolean(req.body?.refresh || req.query?.refresh);
+
+    if (refresh) {
+      summaryCache.delete(`${doc.id}_${mode}`);
+      textCache.delete(doc.id);
+    }
+
+    const { fullText } = await getDocumentExtractedText(doc, refresh);
 
     if (!fullText || fullText.length < 20) {
       return res.status(400).json({
@@ -2217,7 +2814,7 @@ app.post("/api/ai/documents/:id/summary", optionalAuth, accessLimiter, async (re
       });
     }
 
-    const summaryResult = await generateSummary(doc.id, fullText, doc.original_name, mode);
+    const summaryResult = await generateSummary(doc.id, fullText, doc.original_name, mode, refresh);
     res.json({
       success: true,
       documentName: doc.original_name,
