@@ -155,12 +155,29 @@ async function initDatabase() {
           password_hash VARCHAR(255) NOT NULL,
           occupation VARCHAR(100) NULL,
           security_pin_hash VARCHAR(255) NULL,
+          email_verified TINYINT(1) NOT NULL DEFAULT 1,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
 
       await safeAddColumn(pool, "users", "occupation", "VARCHAR(100) NULL");
       await safeAddColumn(pool, "users", "security_pin_hash", "VARCHAR(255) NULL");
+      await safeAddColumn(pool, "users", "email_verified", "TINYINT(1) NOT NULL DEFAULT 1");
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS account_otp_tokens (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          user_id BIGINT NOT NULL,
+          email VARCHAR(255) NOT NULL,
+          purpose VARCHAR(40) NOT NULL,
+          otp_hash CHAR(64) NOT NULL,
+          expires_at DATETIME NOT NULL,
+          used_at DATETIME NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_account_otp_lookup (user_id, purpose, used_at),
+          INDEX idx_account_otp_expiry (expires_at)
+        );
+      `);
 
       // 2. Documents Table (Metadata for Backblaze B2 objects)
       // Plain-text access codes are NEVER stored here; only access_code_hash is used for lookups.
@@ -267,7 +284,7 @@ async function findUserByEmail(email) {
   const normalizedEmail = email.toLowerCase().trim();
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, full_name, email, password_hash, occupation, security_pin_hash, created_at FROM users WHERE LOWER(email) = ? LIMIT 1`,
+      `SELECT id, full_name, email, password_hash, occupation, security_pin_hash, email_verified, created_at FROM users WHERE LOWER(email) = ? LIMIT 1`,
       [normalizedEmail]
     );
     return rows[0] || null;
@@ -280,7 +297,7 @@ async function findUserByEmail(email) {
 async function findUserById(id) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, full_name, email, occupation, (security_pin_hash IS NOT NULL) AS has_security_pin, created_at FROM users WHERE id = ? LIMIT 1`,
+      `SELECT id, full_name, email, occupation, email_verified, (security_pin_hash IS NOT NULL) AS has_security_pin, created_at FROM users WHERE id = ? LIMIT 1`,
       [id]
     );
     if (!rows[0]) return null;
@@ -303,7 +320,7 @@ async function findUserById(id) {
 async function findUserWithSecretsById(id) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, full_name, email, password_hash, occupation, security_pin_hash, created_at FROM users WHERE id = ? LIMIT 1`,
+      `SELECT id, full_name, email, password_hash, occupation, security_pin_hash, email_verified, created_at FROM users WHERE id = ? LIMIT 1`,
       [id]
     );
     return rows[0] || null;
@@ -318,7 +335,7 @@ async function createUser({ full_name, email, password_hash, occupation = null, 
   const cleanOccupation = occupation && typeof occupation === "string" ? occupation.trim() : null;
   if (isTiDBConnected && pool) {
     const [result] = await pool.query(
-      `INSERT INTO users (full_name, email, password_hash, occupation, security_pin_hash) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO users (full_name, email, password_hash, occupation, security_pin_hash, email_verified) VALUES (?, ?, ?, ?, ?, 0)`,
       [full_name.trim(), normalizedEmail, password_hash, cleanOccupation, security_pin_hash]
     );
     return {
@@ -327,6 +344,7 @@ async function createUser({ full_name, email, password_hash, occupation = null, 
       email: normalizedEmail,
       occupation: cleanOccupation,
       has_security_pin: Boolean(security_pin_hash),
+      email_verified: false,
       created_at: new Date().toISOString(),
     };
   } else {
@@ -343,6 +361,7 @@ async function createUser({ full_name, email, password_hash, occupation = null, 
       password_hash,
       occupation: cleanOccupation,
       security_pin_hash,
+      email_verified: false,
       created_at: new Date().toISOString(),
     };
     users.push(newUser);
@@ -391,6 +410,17 @@ async function updateUserProfile(id, { full_name, occupation, security_pin_hash 
     }
   }
   return await findUserById(id);
+}
+
+async function markUserEmailVerified(id) {
+  if (isTiDBConnected && pool) {
+    await pool.query("UPDATE users SET email_verified = 1 WHERE id = ?", [id]);
+    return;
+  }
+  const users = loadLocalUsers().map((user) =>
+    user.id === Number(id) ? { ...user, email_verified: true } : user
+  );
+  saveLocalUsers(users);
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,6 +1041,7 @@ module.exports = {
   findUserWithSecretsById,
   createUser,
   updateUserProfile,
+  markUserEmailVerified,
   saveDocument,
   findDocumentByHash,
   findDocumentById,

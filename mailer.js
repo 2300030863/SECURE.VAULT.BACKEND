@@ -1,33 +1,72 @@
-const nodemailer = require("nodemailer");
+function isBrevoConfigured() {
+  const apiKey = process.env.BREVO_API_KEY?.trim();
+  const senderEmail = process.env.BREVO_SENDER_EMAIL?.trim();
+  return Boolean(
+    apiKey &&
+    apiKey !== "YOUR_COPIED_API_KEY" &&
+    senderEmail &&
+    senderEmail !== "your_verified_sender_email"
+  );
+}
 
-function createTransporter() {
-  const user = process.env.GMAIL_USER;
-  const pass = process.env.GMAIL_APP_PASSWORD;
+function getBrevoSender() {
+  return {
+    name: process.env.BREVO_SENDER_NAME?.trim() || "DocQevrilo",
+    email: process.env.BREVO_SENDER_EMAIL?.trim(),
+  };
+}
 
-  // Check if credentials are placeholder or missing
-  const isConfigured =
-    user &&
-    pass &&
-    user !== "your-email@gmail.com" &&
-    pass !== "your-16-character-app-password" &&
-    !user.includes("example.com");
+async function sendBrevoEmail({ to, subject, html, text, otpCode }) {
+  const apiKey = process.env.BREVO_API_KEY?.trim();
+  const sender = getBrevoSender();
 
-  if (!isConfigured) {
-    return null;
+  if (!apiKey || !sender.email) {
+    const error = new Error(
+      "Brevo email service is not configured. Add BREVO_API_KEY and BREVO_SENDER_EMAIL to backend/.env."
+    );
+    error.code = "BREVO_NOT_CONFIGURED";
+    throw error;
   }
 
-  return nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 587,
-    secure: false,
-    auth: {
-      user: user.trim(),
-      pass: pass.trim().replace(/\s+/g, ""), // Remove any accidental spaces in app password
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "api-key": apiKey,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
     },
-    tls: {
-      rejectUnauthorized: true,
-    },
+    body: JSON.stringify({
+      sender,
+      to: [{ email: to }],
+      subject: subject,
+      htmlContent: html || `<p>${text || ""}</p>`,
+      textContent: text || undefined,
+    }),
   });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    console.error("[Brevo API Error]", data);
+    const deliveryError = new Error(data.message || `Brevo returned status ${response.status}`);
+    deliveryError.code = "BREVO_DELIVERY_ERROR";
+    deliveryError.details = data;
+    throw deliveryError;
+  }
+
+  return { messageId: data.messageId || "sent", provider: "brevo", otpCode };
+}
+
+async function sendEmail(message) {
+  if (!isBrevoConfigured()) {
+    const error = new Error(
+      "Brevo email service is not configured. Add BREVO_API_KEY & BREVO_SENDER_EMAIL to backend/.env."
+    );
+    error.code = "BREVO_NOT_CONFIGURED";
+    throw error;
+  }
+
+  return await sendBrevoEmail(message);
 }
 
 /**
@@ -37,19 +76,7 @@ function createTransporter() {
  * @param {string} [otpCode] - 6-digit OTP code
  */
 async function sendResetEmail(email, resetUrl, otpCode = "") {
-  const transporter = createTransporter();
-
-  // If Gmail SMTP credentials are not configured, throw a clear error
-  if (!transporter) {
-    const error = new Error("Gmail credentials are not configured. Please enter your GMAIL_USER and GMAIL_APP_PASSWORD in backend/.env to send OTP emails.");
-    error.code = "SMTP_NOT_CONFIGURED";
-    throw error;
-  }
-
-  const sender = process.env.GMAIL_USER.trim();
-
-  await transporter.sendMail({
-    from: `"DocQevrilo" <${sender}>`,
+  await sendEmail({
     to: email,
     subject: otpCode
       ? `Your DocQevrilo Password Reset Code: ${otpCode}`
@@ -139,18 +166,9 @@ async function sendResetEmail(email, resetUrl, otpCode = "") {
  * @param {string} action - 'reveal' or 'regenerate'
  */
 async function sendAccessCodeOtpEmail(email, otpCode, docName = "Document Archive", action = "reveal") {
-  const transporter = createTransporter();
-  if (!transporter) {
-    const error = new Error("Gmail credentials are not configured in backend/.env.");
-    error.code = "SMTP_NOT_CONFIGURED";
-    throw error;
-  }
-
-  const sender = process.env.GMAIL_USER.trim();
   const actionLabel = action === "regenerate" ? "Regenerate Vault Access Code" : "Reveal Vault Access Code";
 
-  await transporter.sendMail({
-    from: `"DocQevrilo Vault Security" <${sender}>`,
+  await sendEmail({
     to: email,
     subject: `Your Security OTP to ${actionLabel}: ${otpCode}`,
     text: [
@@ -200,8 +218,65 @@ async function sendAccessCodeOtpEmail(email, otpCode, docName = "Document Archiv
   return { messageId: "sent", otpCode };
 }
 
+async function sendVerificationEmail(email, otpCode) {
+  await sendEmail({
+    to: email,
+    subject: `Verify your DocQevrilo email: ${otpCode}`,
+    text: [
+      "Welcome to DocQevrilo.",
+      "",
+      `Your email verification code is: ${otpCode}`,
+      "This code expires in 10 minutes.",
+      "If you did not create this account, you can ignore this email.",
+    ].join("\n"),
+    html: `
+      <div style="background:#09090b;font-family:Arial,sans-serif;color:#fafafa;padding:32px 16px;">
+        <div style="max-width:520px;margin:0 auto;background:#18181b;border:1px solid #27272a;border-radius:16px;padding:32px;text-align:center;">
+          <div style="font-size:28px;margin-bottom:12px;">🛡️</div>
+          <h1 style="margin:0 0 8px;color:#fff;">Verify your DocQevrilo email</h1>
+          <p style="color:#a1a1aa;line-height:1.6;">Use this one-time code to activate your secure vault account.</p>
+          <div style="margin:24px 0;padding:18px;background:#09090b;border:1px solid #3f3f46;border-radius:12px;font-size:34px;font-weight:800;letter-spacing:8px;color:#f87171;font-family:monospace;">${otpCode}</div>
+          <p style="color:#a1a1aa;font-size:13px;">This code expires in 10 minutes.</p>
+        </div>
+      </div>
+    `,
+    otpCode,
+  });
+  return { messageId: "sent", otpCode };
+}
+
+async function sendPinRecoveryOtpEmail(email, otpCode) {
+  await sendEmail({
+    to: email,
+    subject: `Your DocQevrilo Security PIN recovery code: ${otpCode}`,
+    text: [
+      "A request was made to replace your DocQevrilo 4-digit Security PIN.",
+      "",
+      `Your verification code is: ${otpCode}`,
+      "This code expires in 10 minutes.",
+      "If you did not request this, sign in and secure your account.",
+    ].join("\n"),
+    html: `
+      <div style="background:#09090b;font-family:Arial,sans-serif;color:#fafafa;padding:32px 16px;">
+        <div style="max-width:520px;margin:0 auto;background:#18181b;border:1px solid #27272a;border-radius:16px;padding:32px;text-align:center;">
+          <div style="font-size:28px;margin-bottom:12px;">🔐</div>
+          <h1 style="margin:0 0 8px;color:#fff;">Security PIN recovery</h1>
+          <p style="color:#a1a1aa;line-height:1.6;">Use this code to create a new 4-digit Security PIN.</p>
+          <div style="margin:24px 0;padding:18px;background:#09090b;border:1px solid #3f3f46;border-radius:12px;font-size:34px;font-weight:800;letter-spacing:8px;color:#f87171;font-family:monospace;">${otpCode}</div>
+          <p style="color:#a1a1aa;font-size:13px;">This code expires in 10 minutes. Never share it.</p>
+        </div>
+      </div>
+    `,
+    otpCode,
+  });
+  return { messageId: "sent", otpCode };
+}
+
 module.exports = {
   sendResetEmail,
   sendAccessCodeOtpEmail,
-  isEmailConfigured: () => Boolean(createTransporter())
+  sendVerificationEmail,
+  sendPinRecoveryOtpEmail,
+  isEmailConfigured: () => isBrevoConfigured(),
+  isBrevoConfigured,
 };

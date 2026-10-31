@@ -36,6 +36,7 @@ const {
   findUserWithSecretsById,
   createUser,
   updateUserProfile,
+  markUserEmailVerified,
   saveDocument,
   findDocumentByHash,
   findDocumentById,
@@ -54,8 +55,14 @@ const {
   finalizeDownload,
   getDbStatus
 } = require("./db");
-const { sendAccessCodeOtpEmail } = require("./mailer");
+const {
+  sendAccessCodeOtpEmail,
+  sendVerificationEmail,
+  sendPinRecoveryOtpEmail,
+} = require("./mailer");
+const db = require("./db");
 const authRoutes = require("./authRoutes");
+const { checkOtpRateLimit, resetOtpRateLimit, getOtpRateLimitStatus } = require("./otpRateLimiter");
 const {
   extractDocumentText,
   generateSummary,
@@ -355,14 +362,295 @@ app.get("/api/status", (req, res) => {
 // Mount Forgot Password & Reset Password Router
 app.use("/api/auth", authRoutes);
 
+function createOtpCode() {
+  return crypto.randomInt(100000, 1000000).toString();
+}
+
+function hashOtpCode(code) {
+  return crypto.createHash("sha256").update(code).digest("hex");
+}
+
+async function issueAccountOtp(user, purpose, sendEmail) {
+  const otpCode = createOtpCode();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
+    .toISOString()
+    .slice(0, 19)
+    .replace("T", " ");
+
+  const pool = await db.getPool();
+  if (pool) {
+    await db.execute(
+      "DELETE FROM account_otp_tokens WHERE user_id = ? AND purpose = ? AND used_at IS NULL",
+      [user.id, purpose]
+    );
+    await db.execute(
+      "INSERT INTO account_otp_tokens (user_id, email, purpose, otp_hash, expires_at) VALUES (?, ?, ?, ?, ?)",
+      [user.id, user.email, purpose, hashOtpCode(otpCode), expiresAt]
+    );
+  } else {
+    accountOtpMemory.set(`${user.id}:${purpose}`, {
+      hash: hashOtpCode(otpCode),
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+  }
+
+  console.log(`\n🔑 [Account OTP] Code for ${user.email} (${purpose}): >>> ${otpCode} <<< (Expires in 10 minutes)\n`);
+
+  try {
+    await sendEmail(user.email, otpCode);
+    return { success: true, emailSent: true, otpCode };
+  } catch (emailErr) {
+    console.warn(`[Account OTP Email Warning] Could not deliver ${purpose} email to ${user.email}: ${emailErr.message}`);
+    return { success: true, emailSent: false, error: emailErr.message, otpCode };
+  }
+}
+
+const accountOtpMemory = new Map();
+
+async function consumeAccountOtp(userId, purpose, otpCode) {
+  const pool = await db.getPool();
+  if (!pool) {
+    const key = `${userId}:${purpose}`;
+    const record = accountOtpMemory.get(key);
+    if (!record || record.expiresAt <= Date.now() || record.hash !== hashOtpCode(otpCode)) {
+      return false;
+    }
+    accountOtpMemory.delete(key);
+    return true;
+  }
+  const [rows] = await db.execute(
+    `SELECT id FROM account_otp_tokens
+     WHERE user_id = ? AND purpose = ? AND otp_hash = ?
+       AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()
+     ORDER BY id DESC LIMIT 1`,
+    [userId, purpose, hashOtpCode(otpCode)]
+  );
+  if (!rows || rows.length === 0) return false;
+  await db.execute(
+    "UPDATE account_otp_tokens SET used_at = UTC_TIMESTAMP() WHERE id = ?",
+    [rows[0].id]
+  );
+  return true;
+}
+
+async function sendRegistrationVerification(user) {
+  return issueAccountOtp(user, "email_verification", sendVerificationEmail);
+}
+
+app.post("/api/auth/verify-email", accessLimiter, async (req, res) => {
+  const email = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  const otp = typeof req.body.otp === "string" ? req.body.otp.trim() : "";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) {
+    return res.status(400).json({ error: "Enter a valid email address and 6-digit verification code." });
+  }
+
+  try {
+    const user = await findUserByEmail(email);
+    if (!user) return res.status(400).json({ error: "Invalid or expired verification code." });
+    if (user.email_verified) return res.json({ success: true, message: "Email is already verified." });
+    if (!(await consumeAccountOtp(user.id, "email_verification", otp))) {
+      return res.status(400).json({ error: "Invalid or expired verification code." });
+    }
+    await markUserEmailVerified(user.id);
+    return res.json({ success: true, message: "Email verified successfully. You can now sign in." });
+  } catch (err) {
+    console.error("[Email Verification Error]", err.message);
+    return res.status(500).json({ error: "Unable to verify the email right now." });
+  }
+});
+
+app.post("/api/auth/resend-verification", accessLimiter, async (req, res) => {
+  const email = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: "Enter a valid email address." });
+  }
+
+  // 3-Attempt OTP limit with 20-minute hold on 4th attempt
+  const rateLimitCheck = checkOtpRateLimit(email, "email_verification", 3, 20);
+  if (!rateLimitCheck.allowed) {
+    return res.status(429).json({
+      error: rateLimitCheck.message,
+      locked: true,
+      minutesRemaining: rateLimitCheck.minutesRemaining,
+    });
+  }
+
+  try {
+    const user = await findUserByEmail(email);
+    if (!user || user.email_verified) {
+      return res.json({ success: true, message: "If the account needs verification, a new code has been sent." });
+    }
+    const otpResult = await sendRegistrationVerification(user);
+    return res.json({
+      success: true,
+      emailSent: otpResult.emailSent,
+      message: otpResult.emailSent
+        ? "A new verification code has been sent to your email."
+        : "A new verification code has been generated.",
+      attemptsRemaining: rateLimitCheck.attemptsRemaining,
+      devOtp: process.env.NODE_ENV !== "production" || !otpResult.emailSent ? otpResult.otpCode : undefined,
+    });
+  } catch (err) {
+    console.error("[Email Verification Request Error]", err.message);
+    return res.status(500).json({
+      error: "Unable to process verification code request right now.",
+    });
+  }
+});
+
+// Inline Pre-Registration Email OTP: Send
+app.post("/api/auth/send-email-otp", async (req, res) => {
+  try {
+    const email = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Please enter a valid email address." });
+    }
+
+    const existingUser = await findUserByEmail(email);
+    if (existingUser && existingUser.email_verified) {
+      return res.status(409).json({ error: "An account with this email already exists. Please sign in." });
+    }
+
+    // 3-Attempt limit with 20-minute hold on 4th attempt
+    const rateLimitCheck = checkOtpRateLimit(email, "email_verification", 3, 20);
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: rateLimitCheck.message,
+        locked: true,
+        minutesRemaining: rateLimitCheck.minutesRemaining,
+      });
+    }
+
+    const otpCode = createOtpCode();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString().slice(0, 19).replace("T", " ");
+
+    const pool = await db.getPool();
+    if (pool) {
+      await db.execute(
+        "DELETE FROM account_otp_tokens WHERE email = ? AND purpose = 'email_verification' AND used_at IS NULL",
+        [email]
+      );
+      await db.execute(
+        "INSERT INTO account_otp_tokens (user_id, email, purpose, otp_hash, expires_at) VALUES (?, ?, ?, ?, ?)",
+        [existingUser ? existingUser.id : 0, email, "email_verification", hashOtpCode(otpCode), expiresAt]
+      );
+    } else {
+      accountOtpMemory.set(`reg:${email}:email_verification`, {
+        hash: hashOtpCode(otpCode),
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      });
+    }
+
+    console.log(`\n🔑 [Inline Email OTP] Code for ${email}: >>> ${otpCode} <<< (Attempt ${rateLimitCheck.attemptsCount}/3, expires in 10m)\n`);
+
+    let emailSent = false;
+    let emailErrorMsg = "";
+
+    try {
+      await sendVerificationEmail(email, otpCode);
+      emailSent = true;
+    } catch (emailErr) {
+      console.warn("[Email Send Warning]:", emailErr.message);
+      emailErrorMsg = emailErr.message || "";
+    }
+
+    if (!emailSent) {
+      const isBrevoIpBlocked = emailErrorMsg.includes("authorised_ips");
+      const isDev = process.env.NODE_ENV !== "production";
+
+      if (isDev) {
+        return res.json({
+          success: true,
+          emailSent: false,
+          warning: isBrevoIpBlocked
+            ? `Brevo IP authorization required: please add your IP in https://app.brevo.com/security/authorised_ips. (Local OTP: ${otpCode})`
+            : `Email delivery notice: ${emailErrorMsg}. (Local OTP: ${otpCode})`,
+          message: `Verification code generated! (Dev OTP: ${otpCode})`,
+          devOtp: otpCode,
+          attemptsRemaining: rateLimitCheck.attemptsRemaining,
+        });
+      }
+
+      return res.status(502).json({
+        error: isBrevoIpBlocked
+          ? "Brevo IP authorization needed: add your server IP in https://app.brevo.com/security/authorised_ips"
+          : `Could not deliver verification email: ${emailErrorMsg}`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      emailSent: true,
+      message: `A 6-digit verification code has been sent to ${email}.`,
+      attemptsRemaining: rateLimitCheck.attemptsRemaining,
+    });
+  } catch (err) {
+    console.error("[Send Email OTP Error]", err);
+    return res.status(500).json({ error: "Failed to send verification code." });
+  }
+});
+
+// Inline Pre-Registration Email OTP: Verify
+app.post("/api/auth/verify-email-otp", async (req, res) => {
+  try {
+    const email = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    const otp = typeof req.body.otp === "string" ? req.body.otp.trim() : "";
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) {
+      return res.status(400).json({ error: "Enter a valid email address and 6-digit verification code." });
+    }
+
+    const pool = await db.getPool();
+    let isMatch = false;
+
+    if (pool) {
+      const [rows] = await db.execute(
+        `SELECT id FROM account_otp_tokens
+         WHERE LOWER(email) = ? AND purpose = 'email_verification' AND otp_hash = ?
+           AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()
+         ORDER BY id DESC LIMIT 1`,
+        [email, hashOtpCode(otp)]
+      );
+      if (rows && rows.length > 0) {
+        await db.execute("UPDATE account_otp_tokens SET used_at = UTC_TIMESTAMP() WHERE id = ?", [rows[0].id]);
+        isMatch = true;
+      }
+    } else {
+      const key = `reg:${email}:email_verification`;
+      const rec = accountOtpMemory.get(key);
+      if (rec && rec.expiresAt > Date.now() && rec.hash === hashOtpCode(otp)) {
+        accountOtpMemory.delete(key);
+        isMatch = true;
+      }
+    }
+
+    if (!isMatch) {
+      return res.status(400).json({ error: "Invalid or expired 6-digit verification code." });
+    }
+
+    resetOtpRateLimit(email, "email_verification");
+    const verificationProof = crypto.createHmac("sha256", JWT_SECRET).update(`verified:${email}`).digest("hex");
+
+    return res.json({
+      success: true,
+      message: "Email verified successfully!",
+      verificationProof,
+    });
+  } catch (err) {
+    console.error("[Verify Email OTP Error]", err);
+    return res.status(500).json({ error: "Verification failed. Please try again." });
+  }
+});
+
 // 1. Register User
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { fullName, email, password, occupation, securityPin } = req.body;
+    const { fullName, email, password, occupation, securityPin, verificationProof } = req.body;
     if (!fullName || typeof fullName !== "string" || fullName.trim().length < 2) {
       return res.status(400).json({ error: "Full name must be at least 2 characters." });
     }
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    const cleanEmail = email ? email.trim().toLowerCase() : "";
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       return res.status(400).json({ error: "Please enter a valid email address." });
     }
     if (!password || password.length < 8) {
@@ -375,32 +663,59 @@ app.post("/api/auth/register", async (req, res) => {
       }
     }
 
-    const existingUser = await findUserByEmail(email);
+    const expectedProof = crypto.createHmac("sha256", JWT_SECRET).update(`verified:${cleanEmail}`).digest("hex");
+    const isPreVerified = Boolean(verificationProof && verificationProof === expectedProof);
+
+    const existingUser = await findUserByEmail(cleanEmail);
     if (existingUser) {
-      return res.status(409).json({ error: "An account with this email already exists." });
+      if (existingUser.email_verified) {
+        return res.status(409).json({ error: "An account with this email already exists. Please sign in." });
+      }
+    }
+
+    // Require email to be verified before creating an account
+    if (!isPreVerified) {
+      return res.status(400).json({
+        error: "Please verify your email address using the 'Verify' button before creating an account.",
+        requiresInlineEmailVerification: true,
+      });
     }
 
     const password_hash = await bcrypt.hash(password, 10);
     const security_pin_hash = securityPin ? await bcrypt.hash(String(securityPin).trim(), 10) : null;
     const cleanOccupation = occupation && typeof occupation === "string" ? occupation.trim() : null;
 
-    const newUser = await createUser({
-      full_name: fullName,
-      email,
-      password_hash,
-      occupation: cleanOccupation,
-      security_pin_hash,
-    });
+    let userRecord = existingUser;
+    if (!userRecord) {
+      userRecord = await createUser({
+        full_name: fullName,
+        email: cleanEmail,
+        password_hash,
+        occupation: cleanOccupation,
+        security_pin_hash,
+      });
+    }
+
+    await markUserEmailVerified(userRecord.id);
+
+    const token = jwt.sign(
+      { id: userRecord.id, email: userRecord.email, name: userRecord.full_name },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
 
     res.status(201).json({
       success: true,
-      message: "Account created successfully. You can now sign in.",
+      message: "Account created and email verified! Welcome to your vault.",
+      token,
+      requiresEmailVerification: false,
       user: {
-        id: newUser.id,
-        name: newUser.full_name,
-        email: newUser.email,
-        occupation: newUser.occupation,
-        has_security_pin: Boolean(security_pin_hash),
+        id: userRecord.id,
+        name: userRecord.full_name,
+        email: userRecord.email,
+        occupation: userRecord.occupation,
+        has_security_pin: Boolean(security_pin_hash || userRecord.security_pin_hash),
+        email_verified: true,
       }
     });
   } catch (err) {
@@ -420,6 +735,14 @@ app.post("/api/auth/login", accessLimiter, async (req, res) => {
     const user = await findUserByEmail(email);
     if (!user) {
       return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    if (user.email_verified === false || user.email_verified === 0) {
+      return res.status(403).json({
+        error: "Please verify your email before signing in.",
+        requiresEmailVerification: true,
+        email: user.email,
+      });
     }
 
     const isMatch = await bcrypt.compare(password, user.password_hash);
@@ -465,6 +788,7 @@ app.get("/api/auth/me", requireAuth, async (req, res) => {
         email: user.email,
         occupation: user.occupation,
         has_security_pin: Boolean(user.has_security_pin),
+        email_verified: user.email_verified !== false && user.email_verified !== 0,
       }
     });
   } catch (err) {
@@ -475,27 +799,63 @@ app.get("/api/auth/me", requireAuth, async (req, res) => {
 // 4. Update Profile & Security PIN
 app.put("/api/auth/profile", requireAuth, async (req, res) => {
   try {
-    const { fullName, occupation, newPin, currentPassword } = req.body;
+    const { fullName, occupation, newPin, currentPin, currentPassword, pinRecoveryOtp } = req.body;
 
     const user = await findUserWithSecretsById(req.user.id);
     if (!user) {
       return res.status(404).json({ error: "User account not found." });
     }
 
-    // If currentPassword is provided and not equal to newPin, verify it against user's password_hash
-    if (currentPassword && typeof currentPassword === "string" && currentPassword.trim() && currentPassword !== newPin) {
-      const isMatch = await bcrypt.compare(currentPassword.trim(), user.password_hash);
-      if (!isMatch) {
-        return res.status(401).json({ error: "Incorrect account login password entered." });
-      }
-    }
-
     let security_pin_hash = undefined;
-    if (newPin !== undefined && newPin !== null && newPin !== "") {
+    if (newPin !== undefined && newPin !== null && String(newPin).trim() !== "") {
       const cleanPin = String(newPin).trim();
       if (!/^\d{4}$/.test(cleanPin)) {
         return res.status(400).json({ error: "Security PIN must be exactly 4 digits (0-9)." });
       }
+
+      // If user already has a PIN configured, require authorization!
+      if (user.security_pin_hash) {
+        let isAuthorized = false;
+
+        // Method 1: Email OTP verification (Forgot PIN flow)
+        if (pinRecoveryOtp && String(pinRecoveryOtp).trim()) {
+          const otpCode = String(pinRecoveryOtp).trim();
+          if (!/^\d{6}$/.test(otpCode)) {
+            return res.status(400).json({ error: "Email recovery code must be exactly 6 digits." });
+          }
+          const validRecoveryOtp = await consumeAccountOtp(user.id, "pin_recovery", otpCode);
+          if (!validRecoveryOtp) {
+            return res.status(400).json({ error: "Invalid or expired PIN recovery code." });
+          }
+          resetOtpRateLimit(user.email, "pin_recovery");
+          isAuthorized = true;
+        }
+
+        // Method 2: Current PIN or Password verification
+        const credentialCandidate = (currentPin || currentPassword || "").toString().trim();
+        if (!isAuthorized && credentialCandidate) {
+          // Check against current PIN
+          const isPinMatch = await bcrypt.compare(credentialCandidate, user.security_pin_hash);
+          if (isPinMatch) {
+            isAuthorized = true;
+          } else {
+            // Check against account password
+            const isPasswordMatch = await bcrypt.compare(credentialCandidate, user.password_hash);
+            if (isPasswordMatch) {
+              isAuthorized = true;
+            } else {
+              return res.status(401).json({ error: "Incorrect current PIN or account password." });
+            }
+          }
+        }
+
+        if (!isAuthorized) {
+          return res.status(400).json({
+            error: "To change your Security PIN, enter your current PIN/password or verify via email code."
+          });
+        }
+      }
+
       security_pin_hash = await bcrypt.hash(cleanPin, 10);
     }
 
@@ -513,12 +873,72 @@ app.put("/api/auth/profile", requireAuth, async (req, res) => {
         name: updated.full_name,
         email: updated.email,
         occupation: updated.occupation,
-        has_security_pin: Boolean(updated.has_security_pin || security_pin_hash),
+        has_security_pin: Boolean(updated.has_security_pin || security_pin_hash || user.security_pin_hash),
       },
     });
   } catch (err) {
     console.error("[Profile Update Error]", err);
     res.status(500).json({ error: err.message || "Failed to update profile." });
+  }
+});
+
+app.get("/api/auth/pin-recovery-status", requireAuth, async (req, res) => {
+  try {
+    const user = await findUserById(req.user.id);
+    if (!user) return res.status(404).json({ error: "User account not found." });
+    const status = getOtpRateLimitStatus(user.email, "pin_recovery");
+    return res.json({ success: true, ...status });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/auth/request-pin-recovery", requireAuth, accessLimiter, async (req, res) => {
+  try {
+    const user = await findUserWithSecretsById(req.user.id);
+    if (!user) return res.status(404).json({ error: "User account not found." });
+    if (user.email_verified === false || user.email_verified === 0) {
+      return res.status(403).json({ error: "Verify your account email before recovering the Security PIN." });
+    }
+
+    // 3-Attempt OTP limit with 20-minute hold on 4th attempt
+    const rateLimitCheck = checkOtpRateLimit(user.email, "pin_recovery", 3, 20);
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: rateLimitCheck.message,
+        locked: true,
+        minutesRemaining: rateLimitCheck.minutesRemaining,
+      });
+    }
+
+    const otpResult = await issueAccountOtp(user, "pin_recovery", sendPinRecoveryOtpEmail);
+    if (!otpResult.emailSent && process.env.NODE_ENV !== "production") {
+      const isBrevoIpBlocked = (otpResult.error || "").includes("authorised_ips");
+      return res.json({
+        success: true,
+        emailSent: false,
+        warning: isBrevoIpBlocked
+          ? `Brevo IP authorization needed: add your IP in https://app.brevo.com/security/authorised_ips. (Local OTP: ${otpResult.otpCode})`
+          : `Email delivery notice: ${otpResult.error}. (Local OTP: ${otpResult.otpCode})`,
+        message: `PIN recovery code generated! (Dev OTP: ${otpResult.otpCode})`,
+        devOtp: otpResult.otpCode,
+        attemptsRemaining: rateLimitCheck.attemptsRemaining,
+      });
+    }
+
+    return res.json({
+      success: true,
+      emailSent: otpResult.emailSent,
+      message: "A PIN recovery code has been sent to your account email.",
+      attemptsRemaining: rateLimitCheck.attemptsRemaining,
+    });
+  } catch (err) {
+    console.error("[PIN Recovery Email Error]", err.message);
+    return res.status(500).json({
+      error: err.code === "BREVO_NOT_CONFIGURED"
+        ? "Email delivery is not configured. Add BREVO_API_KEY and BREVO_SENDER_EMAIL to the backend environment."
+        : "Unable to process the PIN recovery request right now.",
+    });
   }
 });
 

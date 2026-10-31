@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const rateLimit = require("express-rate-limit");
 const db = require("./db");
 const { sendResetEmail, isEmailConfigured } = require("./mailer");
+const { checkOtpRateLimit, resetOtpRateLimit } = require("./otpRateLimiter");
 
 const router = express.Router();
 
@@ -47,6 +48,16 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
   if (!validEmail(email)) {
     return res.status(400).json({
       message: "Please enter a valid email address.",
+    });
+  }
+
+  // 3-Attempt OTP limit with 20-minute hold on 4th attempt
+  const rateLimitCheck = checkOtpRateLimit(email, "forgot_password", 3, 20);
+  if (!rateLimitCheck.allowed) {
+    return res.status(429).json({
+      message: rateLimitCheck.message,
+      locked: true,
+      minutesRemaining: rateLimitCheck.minutesRemaining,
     });
   }
 
@@ -111,24 +122,47 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
     resetUrl.searchParams.set("email", user.email);
 
     let mailResult;
+    let emailSent = false;
+    let mailErrorMsg = "";
+
     try {
       mailResult = await sendResetEmail(user.email, resetUrl.toString(), otpCode);
+      emailSent = true;
     } catch (mailError) {
-      console.error("[SMTP Mail Delivery Error]:", mailError.message);
-      // Invalidate the token immediately if sending fails
+      console.error("[Mail Delivery Error]:", mailError.message);
+      mailErrorMsg = mailError.message || "";
+    }
+
+    if (!emailSent) {
+      const isBrevoIpBlocked = mailErrorMsg.includes("authorised_ips");
+      if (process.env.NODE_ENV !== "production") {
+        console.log(`\n🔑 [Forgot Password OTP] Code for ${user.email}: >>> ${otpCode} <<< (Expires in 15m)\n`);
+        return res.json({
+          success: true,
+          emailSent: false,
+          warning: isBrevoIpBlocked
+            ? `Brevo IP authorization needed: add your IP at https://app.brevo.com/security/authorised_ips. (Local OTP: ${otpCode})`
+            : `Email delivery issue: ${mailErrorMsg}. (Local OTP: ${otpCode})`,
+          message: `Password reset code generated! (Dev OTP: ${otpCode})`,
+          email: user.email,
+          devOtp: otpCode,
+        });
+      }
+
       await db.execute(
         "DELETE FROM password_reset_tokens WHERE token_hash = ?",
         [tokenHash]
       );
-      return res.status(500).json({
-        message: mailError.code === "SMTP_NOT_CONFIGURED"
-          ? "Gmail credentials are not configured. Please enter your GMAIL_USER and GMAIL_APP_PASSWORD in backend/.env to send OTP emails."
-          : `Failed to deliver email: ${mailError.message}. Check your GMAIL_USER & GMAIL_APP_PASSWORD in backend/.env.`,
+      return res.status(502).json({
+        message: isBrevoIpBlocked
+          ? "Brevo IP authorization needed: add your server IP in https://app.brevo.com/security/authorised_ips"
+          : `Failed to deliver email: ${mailErrorMsg}`,
       });
     }
 
     return res.json({
       success: true,
+      emailSent: true,
       message: `A 6-digit OTP verification code has been sent to ${user.email}. Please check your email inbox.`,
       email: user.email,
     });
@@ -183,7 +217,7 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
       const cleanOtp = otp.trim();
 
       const [found] = await connection.execute(
-        `SELECT id, user_id FROM password_reset_tokens 
+        `SELECT id, user_id, email FROM password_reset_tokens 
          WHERE LOWER(email) = ? AND otp_code = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP() 
          ORDER BY id DESC LIMIT 1 FOR UPDATE`,
         [cleanEmail, cleanOtp]
@@ -193,7 +227,7 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
       // Find valid record by 64-char Token Hash
       const tokenHash = hashToken(token.trim());
       const [found] = await connection.execute(
-        `SELECT id, user_id FROM password_reset_tokens 
+        `SELECT id, user_id, email FROM password_reset_tokens 
          WHERE token_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP() 
          LIMIT 1 FOR UPDATE`,
         [tokenHash]
@@ -236,6 +270,10 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
     );
 
     await connection.commit();
+
+    if (resetRecord.email) {
+      resetOtpRateLimit(resetRecord.email, "forgot_password");
+    }
 
     return res.json({
       message: "Password reset successfully! You can now sign in with your new password.",
