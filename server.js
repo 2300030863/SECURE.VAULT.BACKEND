@@ -108,6 +108,7 @@ app.use(
         styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
         fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
         imgSrc: ["'self'", "data:", "blob:", "https:"],
+        mediaSrc: ["'self'", "blob:", "data:", "https:"],
         connectSrc: ["'self'", "https:", "http://localhost:*", "ws:", "wss:"],
         frameAncestors: [
           "'self'",
