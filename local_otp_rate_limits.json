@@ -1,0 +1,7 @@
+{
+  "audit_test:audit_test_1793536321937@example.com": {
+    "attempts": 1,
+    "firstAttemptAt": 1793536321948,
+    "lockedUntil": 0
+  }
+}

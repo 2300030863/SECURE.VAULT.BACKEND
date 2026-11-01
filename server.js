@@ -26,7 +26,7 @@ function createZipArchive(options = { zlib: { level: 0 } }) {
   throw new Error("Cannot initialize ZIP archiver");
 }
 const { finished, pipeline } = require("stream/promises");
-require("dotenv").config();
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const { generateCode, hashCode, legacyHashCode, isValidCodeFormat } = require("./codeGenerator");
 const {
@@ -62,6 +62,7 @@ const {
 } = require("./mailer");
 const db = require("./db");
 const authRoutes = require("./authRoutes");
+const adminRoutes = require("./adminRoutes");
 const { checkOtpRateLimit, resetOtpRateLimit, getOtpRateLimitStatus } = require("./otpRateLimiter");
 const {
   extractDocumentText,
@@ -87,20 +88,41 @@ const {
 const app = express();
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || "0.0.0.0";
-const JWT_SECRET = process.env.JWT_SECRET || "secure_vault_super_secret_jwt_key_2026";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  if (process.env.NODE_ENV === "production") throw new Error("JWT_SECRET must be set to a random value of at least 32 characters.");
+  console.warn("[Security] Set a unique JWT_SECRET (32+ characters) before deployment.");
+}
+const effectiveJwtSecret = JWT_SECRET || crypto.randomBytes(48).toString("hex");
 
 // Trust reverse proxies (Northflank Ingress, Vercel, Cloudflare, etc.)
 app.set("trust proxy", 1);
 
-// Security headers allowing cross-origin embeds from Vercel frontend
+// Hardened security headers with Content Security Policy & framed viewer allowlisting
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
+        imgSrc: ["'self'", "data:", "blob:", "https:"],
+        connectSrc: ["'self'", "https:", "http://localhost:*", "ws:", "wss:"],
+        frameAncestors: [
+          "'self'",
+          "https://secure-vault-delta-virid.vercel.app",
+          "http://localhost:5173",
+          "http://localhost:5174",
+          "http://localhost:3000",
+        ],
+        objectSrc: ["'none'"],
+      },
+    },
     crossOriginResourcePolicy: { policy: "cross-origin" },
-    crossOriginEmbedderPolicy: false,
-    crossOriginOpenerPolicy: false,
-    frameguard: false,
-    xDownloadOptions: false
+    frameguard: false, // Framing restricted securely via CSP frameAncestors for multi-origin support
+    noSniff: true,
+    referrerPolicy: { policy: "strict-origin-when-cross-origin" },
   })
 );
 
@@ -119,13 +141,8 @@ app.use(
     origin: function (origin, callback) {
       if (!origin) return callback(null, true);
       const cleanOrigin = origin.trim().replace(/\/+$/, "");
-      if (
-        allowedOrigins.includes(cleanOrigin) ||
-        /\.vercel\.app$/.test(new URL(origin).hostname)
-      ) {
-        return callback(null, true);
-      }
-      return callback(null, true); // Fallback: allow all origins with credentials for cloud PaaS
+      if (allowedOrigins.includes(cleanOrigin)) return callback(null, true);
+      return callback(null, false);
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
@@ -163,6 +180,13 @@ const MAX_FILES = 20;
 const MAX_FILE_SIZE = 250 * 1024 * 1024; // 250 MB per file
 const MAX_TOTAL_SIZE = 1024 * 1024 * 1024; // 1 GB per upload
 
+// Block dangerous executable and script file types to prevent server/client compromise
+const BLOCKED_FILE_EXTENSIONS = new Set([
+  ".exe", ".bat", ".cmd", ".sh", ".bash", ".php", ".phtml", ".php3", ".php4", ".php5",
+  ".phps", ".jsp", ".asp", ".aspx", ".ps1", ".msi", ".vbs", ".vbe", ".wsf", ".wsh",
+  ".scr", ".pif", ".com", ".hta", ".cpl", ".jar", ".cgi", ".dll", ".so"
+]);
+
 // Multer diskStorage using temporary directory
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -178,6 +202,17 @@ const upload = multer({
   limits: {
     fileSize: MAX_FILE_SIZE,
     files: MAX_FILES,
+  },
+  fileFilter: function (req, file, cb) {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (BLOCKED_FILE_EXTENSIONS.has(ext)) {
+      return cb(new Error(`Files with extension '${ext}' cannot be uploaded for security reasons.`));
+    }
+    // Sanitize filename against null bytes and directory traversal characters
+    file.originalname = path
+      .basename(file.originalname.replace(/\\/g, "/"))
+      .replace(/[\x00-\x1f\x7f]/g, "_");
+    cb(null, true);
   }
 });
 
@@ -212,24 +247,70 @@ const uploadLimiter = rateLimit({
   }
 });
 
-// Helper to extract JWT token from request (header or query param)
+// Dedicated login rate limiter to protect against brute-force password guessing
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15-minute window
+  max: 5, // 5 attempts per window per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many login attempts from this IP address. Please wait 15 minutes before trying again."
+  }
+});
+
+// Helper to extract JWT token strictly from Authorization header (mitigates URL token leakage)
 const extractToken = (req) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
-    return authHeader.substring(7);
-  }
-  if (req.query && (req.query.token || req.query.auth_token)) {
-    return req.query.token || req.query.auth_token;
+    return authHeader.substring(7).trim();
   }
   return null;
 };
+
+// Generates a short-lived (15 minutes), single-document scoped ticket
+function generateDocAccessTicket(userId, docId) {
+  return jwt.sign(
+    { purpose: "doc_access", docId: String(docId), userId: String(userId) },
+    effectiveJwtSecret,
+    { expiresIn: "15m" }
+  );
+}
+
+// Verifies whether request has access to the owner's document via session JWT or scoped doc ticket
+function verifyOwnerDocAccess(req, doc) {
+  if (!doc) return false;
+  // 1. Authenticated session token from Authorization: Bearer <token>
+  if (req.user && Number(req.user.id) === Number(doc.owner_id)) {
+    return true;
+  }
+  // 2. Short-lived scoped document ticket via query param `ticket` (or transition param)
+  const ticketParam = req.query && (req.query.ticket || req.query.token || req.query.auth_token);
+  if (ticketParam) {
+    try {
+      const decoded = jwt.verify(ticketParam, effectiveJwtSecret);
+      // Valid scoped document ticket
+      if (
+        decoded.purpose === "doc_access" &&
+        String(decoded.docId) === String(doc.id) &&
+        Number(decoded.userId) === Number(doc.owner_id)
+      ) {
+        return true;
+      }
+      // Backwards-compatible fallback: verify owner identity matches
+      if (decoded.id && Number(decoded.id) === Number(doc.owner_id)) {
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
+}
 
 // JWT Middleware
 const optionalAuth = (req, res, next) => {
   const token = extractToken(req);
   if (token) {
     try {
-      const decoded = jwt.verify(token, JWT_SECRET);
+      const decoded = jwt.verify(token, effectiveJwtSecret);
       req.user = decoded;
     } catch (_) {
       req.user = null;
@@ -240,7 +321,7 @@ const optionalAuth = (req, res, next) => {
   next();
 };
 
-const requireAuth = (req, res, next) => {
+const requireAuth = async (req, res, next) => {
   const token = extractToken(req);
   if (!token) {
     return res.status(401).json({
@@ -249,12 +330,19 @@ const requireAuth = (req, res, next) => {
     });
   }
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
+    const decoded = jwt.verify(token, effectiveJwtSecret);
+    const account = await findUserById(decoded.id);
+    if (!account || (account.status && account.status !== "active")) {
+      return res.status(403).json({ error: "This account is suspended or no longer active." });
+    }
+    req.user = {
+      ...decoded,
+      role: account.role || "user",
+    };
     next();
   } catch (err) {
     return res.status(401).json({
-      error: "Session expired. Please sign in again.",
+      error: "Session expired or account verification failed. Please sign in again.",
       requireAuth: true
     });
   }
@@ -361,6 +449,7 @@ app.get("/api/status", (req, res) => {
 
 // Mount Forgot Password & Reset Password Router
 app.use("/api/auth", authRoutes);
+app.use("/api/admin", adminRoutes.router);
 
 function createOtpCode() {
   return crypto.randomInt(100000, 1000000).toString();
@@ -394,14 +483,14 @@ async function issueAccountOtp(user, purpose, sendEmail) {
     });
   }
 
-  console.log(`\n🔑 [Account OTP] Code for ${user.email} (${purpose}): >>> ${otpCode} <<< (Expires in 10 minutes)\n`);
+  console.log(`[Account OTP] Code issued for ${user.email} (${purpose}) - expires in 10 minutes`);
 
   try {
     await sendEmail(user.email, otpCode);
-    return { success: true, emailSent: true, otpCode };
+    return { success: true, emailSent: true };
   } catch (emailErr) {
     console.warn(`[Account OTP Email Warning] Could not deliver ${purpose} email to ${user.email}: ${emailErr.message}`);
-    return { success: true, emailSent: false, error: emailErr.message, otpCode };
+    return { success: true, emailSent: false, error: emailErr.message };
   }
 }
 
@@ -466,7 +555,7 @@ app.post("/api/auth/resend-verification", accessLimiter, async (req, res) => {
   }
 
   // 3-Attempt OTP limit with 20-minute hold on 4th attempt
-  const rateLimitCheck = checkOtpRateLimit(email, "email_verification", 3, 20);
+  const rateLimitCheck = await checkOtpRateLimit(email, "email_verification", 3, 20);
   if (!rateLimitCheck.allowed) {
     return res.status(429).json({
       error: rateLimitCheck.message,
@@ -488,7 +577,6 @@ app.post("/api/auth/resend-verification", accessLimiter, async (req, res) => {
         ? "A new verification code has been sent to your email."
         : "A new verification code has been generated.",
       attemptsRemaining: rateLimitCheck.attemptsRemaining,
-      devOtp: process.env.NODE_ENV !== "production" || !otpResult.emailSent ? otpResult.otpCode : undefined,
     });
   } catch (err) {
     console.error("[Email Verification Request Error]", err.message);
@@ -512,7 +600,7 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
     }
 
     // 3-Attempt limit with 20-minute hold on 4th attempt
-    const rateLimitCheck = checkOtpRateLimit(email, "email_verification", 3, 20);
+    const rateLimitCheck = await checkOtpRateLimit(email, "email_verification", 3, 20);
     if (!rateLimitCheck.allowed) {
       return res.status(429).json({
         error: rateLimitCheck.message,
@@ -541,7 +629,7 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
       });
     }
 
-    console.log(`\n🔑 [Inline Email OTP] Code for ${email}: >>> ${otpCode} <<< (Attempt ${rateLimitCheck.attemptsCount}/3, expires in 10m)\n`);
+    console.log(`[Inline Email OTP] Code issued for ${email} (Attempt ${rateLimitCheck.attemptsCount}/3, expires in 10m)`);
 
     let emailSent = false;
     let emailErrorMsg = "";
@@ -556,25 +644,10 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
 
     if (!emailSent) {
       const isBrevoIpBlocked = emailErrorMsg.includes("authorised_ips");
-      const isDev = process.env.NODE_ENV !== "production";
-
-      if (isDev) {
-        return res.json({
-          success: true,
-          emailSent: false,
-          warning: isBrevoIpBlocked
-            ? `Brevo IP authorization required: please add your IP in https://app.brevo.com/security/authorised_ips. (Local OTP: ${otpCode})`
-            : `Email delivery notice: ${emailErrorMsg}. (Local OTP: ${otpCode})`,
-          message: `Verification code generated! (Dev OTP: ${otpCode})`,
-          devOtp: otpCode,
-          attemptsRemaining: rateLimitCheck.attemptsRemaining,
-        });
-      }
-
       return res.status(502).json({
         error: isBrevoIpBlocked
           ? "Brevo IP authorization needed: add your server IP in https://app.brevo.com/security/authorised_ips"
-          : `Could not deliver verification email: ${emailErrorMsg}`,
+          : `Could not deliver verification email: ${emailErrorMsg || "Please try again later."}`,
       });
     }
 
@@ -629,7 +702,7 @@ app.post("/api/auth/verify-email-otp", async (req, res) => {
     }
 
     resetOtpRateLimit(email, "email_verification");
-    const verificationProof = crypto.createHmac("sha256", JWT_SECRET).update(`verified:${email}`).digest("hex");
+    const verificationProof = crypto.createHmac("sha256", effectiveJwtSecret).update(`verified:${email}`).digest("hex");
 
     return res.json({
       success: true,
@@ -663,7 +736,7 @@ app.post("/api/auth/register", async (req, res) => {
       }
     }
 
-    const expectedProof = crypto.createHmac("sha256", JWT_SECRET).update(`verified:${cleanEmail}`).digest("hex");
+    const expectedProof = crypto.createHmac("sha256", effectiveJwtSecret).update(`verified:${cleanEmail}`).digest("hex");
     const isPreVerified = Boolean(verificationProof && verificationProof === expectedProof);
 
     const existingUser = await findUserByEmail(cleanEmail);
@@ -700,7 +773,7 @@ app.post("/api/auth/register", async (req, res) => {
 
     const token = jwt.sign(
       { id: userRecord.id, email: userRecord.email, name: userRecord.full_name },
-      JWT_SECRET,
+      effectiveJwtSecret,
       { expiresIn: "7d" }
     );
 
@@ -725,7 +798,7 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 // 2. Login User
-app.post("/api/auth/login", accessLimiter, async (req, res) => {
+app.post("/api/auth/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -737,6 +810,9 @@ app.post("/api/auth/login", accessLimiter, async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
+    if (user.status && user.status !== "active") {
+      return res.status(403).json({ error: "This account is currently suspended. Contact support." });
+    }
     if (user.email_verified === false || user.email_verified === 0) {
       return res.status(403).json({
         error: "Please verify your email before signing in.",
@@ -750,11 +826,24 @@ app.post("/api/auth/login", accessLimiter, async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
+    const userRole = user.role || "user";
     const token = jwt.sign(
-      { id: user.id, email: user.email, name: user.full_name },
-      JWT_SECRET,
+      {
+        id: user.id,
+        email: user.email,
+        name: user.full_name,
+        role: userRole,
+        tokenType: userRole === "admin" ? "admin" : "user",
+      },
+      effectiveJwtSecret,
       { expiresIn: "7d" }
     );
+
+    if (userRole === "admin" && typeof db.recordAuditLog === "function") {
+      try {
+        await db.recordAuditLog(user.id, "admin.login", null, { source: "unified_login" }, req.ip);
+      } catch (_) {}
+    }
 
     res.json({
       success: true,
@@ -765,6 +854,7 @@ app.post("/api/auth/login", accessLimiter, async (req, res) => {
         email: user.email,
         occupation: user.occupation,
         has_security_pin: Boolean(user.security_pin_hash),
+        role: userRole,
       }
     });
   } catch (err) {
@@ -789,6 +879,7 @@ app.get("/api/auth/me", requireAuth, async (req, res) => {
         occupation: user.occupation,
         has_security_pin: Boolean(user.has_security_pin),
         email_verified: user.email_verified !== false && user.email_verified !== 0,
+        role: user.role || "user",
       }
     });
   } catch (err) {
@@ -886,7 +977,7 @@ app.get("/api/auth/pin-recovery-status", requireAuth, async (req, res) => {
   try {
     const user = await findUserById(req.user.id);
     if (!user) return res.status(404).json({ error: "User account not found." });
-    const status = getOtpRateLimitStatus(user.email, "pin_recovery");
+    const status = await getOtpRateLimitStatus(user.email, "pin_recovery");
     return res.json({ success: true, ...status });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -902,7 +993,7 @@ app.post("/api/auth/request-pin-recovery", requireAuth, accessLimiter, async (re
     }
 
     // 3-Attempt OTP limit with 20-minute hold on 4th attempt
-    const rateLimitCheck = checkOtpRateLimit(user.email, "pin_recovery", 3, 20);
+    const rateLimitCheck = await checkOtpRateLimit(user.email, "pin_recovery", 3, 20);
     if (!rateLimitCheck.allowed) {
       return res.status(429).json({
         error: rateLimitCheck.message,
@@ -912,17 +1003,12 @@ app.post("/api/auth/request-pin-recovery", requireAuth, accessLimiter, async (re
     }
 
     const otpResult = await issueAccountOtp(user, "pin_recovery", sendPinRecoveryOtpEmail);
-    if (!otpResult.emailSent && process.env.NODE_ENV !== "production") {
+    if (!otpResult.emailSent) {
       const isBrevoIpBlocked = (otpResult.error || "").includes("authorised_ips");
-      return res.json({
-        success: true,
-        emailSent: false,
-        warning: isBrevoIpBlocked
-          ? `Brevo IP authorization needed: add your IP in https://app.brevo.com/security/authorised_ips. (Local OTP: ${otpResult.otpCode})`
-          : `Email delivery notice: ${otpResult.error}. (Local OTP: ${otpResult.otpCode})`,
-        message: `PIN recovery code generated! (Dev OTP: ${otpResult.otpCode})`,
-        devOtp: otpResult.otpCode,
-        attemptsRemaining: rateLimitCheck.attemptsRemaining,
+      return res.status(502).json({
+        error: isBrevoIpBlocked
+          ? "Brevo IP authorization needed: add your server IP in https://app.brevo.com/security/authorised_ips"
+          : `Email delivery issue: ${otpResult.error || "Could not deliver PIN recovery code."}`,
       });
     }
 
@@ -2608,14 +2694,14 @@ app.get("/api/documents/download", optionalAuth, handleDownloadOrView);
 app.get("/api/documents/view/:access_code", optionalAuth, handleDownloadOrView);
 app.get("/api/documents/view", optionalAuth, handleDownloadOrView);
 
-// Dedicated owner direct download and view routes (no access code required for owner)
-app.get("/api/documents/owner/:id/view", requireAuth, async (req, res) => {
+// Dedicated owner direct download and view routes (no access code required for owner; authenticated via Bearer token or short-lived ticket)
+app.get("/api/documents/owner/:id/view", optionalAuth, async (req, res) => {
   try {
     const doc = await findDocumentById(req.params.id);
     if (!doc) {
       return res.status(404).json({ error: "Document not found." });
     }
-    if (doc.owner_id && Number(doc.owner_id) !== Number(req.user.id)) {
+    if (!verifyOwnerDocAccess(req, doc)) {
       return res.status(403).json({ error: "Unauthorized access to document." });
     }
     req.query.action = "view";
@@ -2630,13 +2716,13 @@ app.get("/api/documents/owner/:id/view", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/api/documents/owner/:id/download", requireAuth, async (req, res) => {
+app.get("/api/documents/owner/:id/download", optionalAuth, async (req, res) => {
   try {
     const doc = await findDocumentById(req.params.id);
     if (!doc) {
       return res.status(404).json({ error: "Document not found." });
     }
-    if (doc.owner_id && Number(doc.owner_id) !== Number(req.user.id)) {
+    if (!verifyOwnerDocAccess(req, doc)) {
       return res.status(403).json({ error: "Unauthorized access to document." });
     }
     req.query.action = "download";
@@ -2844,7 +2930,7 @@ app.post("/api/documents/request-code-otp", requireAuth, accessLimiter, async (r
       return res.status(403).json({ error: "Unauthorized access to document." });
     }
 
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpCode = createOtpCode();
     const codeHash = crypto.createHash("sha256").update(otpCode).digest("hex");
 
     accessCodeOtps.set(req.user.id, {
@@ -3019,32 +3105,29 @@ async function purgeExpiredDocuments() {
   }
 }
 
+app.set("purgeExpiredDocuments", purgeExpiredDocuments);
+
 // GET /api/documents/mine - List the authenticated user's documents and Online Sharing status
 app.get("/api/documents/mine", requireAuth, async (req, res) => {
   try {
     await purgeExpiredDocuments();
     const docs = await listUserDocuments(req.user.id, 50);
 
-    // Provide a fresh user token query parameter so direct browser navigations (iframe / new tab / download) succeed seamlessly
-    const userToken = jwt.sign(
-      { id: req.user.id, email: req.user.email },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-    const tokenParam = `token=${encodeURIComponent(userToken)}`;
-
+    // Provide short-lived (15m), single-document scoped tickets (mitigates session token exposure in URLs)
     const enrichedDocs = docs.map((doc) => {
       const codeParam = doc.access_code ? encodeURIComponent(doc.access_code) : "";
+      const docTicket = generateDocAccessTicket(req.user.id, doc.id);
+      const ticketParam = `ticket=${encodeURIComponent(docTicket)}`;
       return {
         ...doc,
         view_url: doc.access_code
           ? `/api/documents/view/${codeParam}`
-          : `/api/documents/owner/${doc.id}/view?${tokenParam}`,
+          : `/api/documents/owner/${doc.id}/view?${ticketParam}`,
         download_url: doc.access_code
           ? `/api/documents/download/${codeParam}?action=download`
-          : `/api/documents/owner/${doc.id}/download?${tokenParam}`,
-        owner_view_url: `/api/documents/owner/${doc.id}/view?${tokenParam}`,
-        owner_download_url: `/api/documents/owner/${doc.id}/download?${tokenParam}`
+          : `/api/documents/owner/${doc.id}/download?${ticketParam}`,
+        owner_view_url: `/api/documents/owner/${doc.id}/view?${ticketParam}`,
+        owner_download_url: `/api/documents/owner/${doc.id}/download?${ticketParam}`
       };
     });
     res.json({
@@ -3105,25 +3188,20 @@ app.get("/api/documents/recent", optionalAuth, async (req, res) => {
     await purgeExpiredDocuments();
 
     const docs = await listUserDocuments(req.user.id, 50);
-    const userToken = jwt.sign(
-      { id: req.user.id, email: req.user.email },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-    const tokenParam = `token=${encodeURIComponent(userToken)}`;
-
     const enrichedDocs = docs.map((doc) => {
       const codeParam = doc.access_code ? encodeURIComponent(doc.access_code) : "";
+      const docTicket = generateDocAccessTicket(req.user.id, doc.id);
+      const ticketParam = `ticket=${encodeURIComponent(docTicket)}`;
       return {
         ...doc,
         view_url: doc.access_code
           ? `/api/documents/view/${codeParam}`
-          : `/api/documents/owner/${doc.id}/view?${tokenParam}`,
+          : `/api/documents/owner/${doc.id}/view?${ticketParam}`,
         download_url: doc.access_code
           ? `/api/documents/download/${codeParam}?action=download`
-          : `/api/documents/owner/${doc.id}/download?${tokenParam}`,
-        owner_view_url: `/api/documents/owner/${doc.id}/view?${tokenParam}`,
-        owner_download_url: `/api/documents/owner/${doc.id}/download?${tokenParam}`
+          : `/api/documents/owner/${doc.id}/download?${ticketParam}`,
+        owner_view_url: `/api/documents/owner/${doc.id}/view?${ticketParam}`,
+        owner_download_url: `/api/documents/owner/${doc.id}/download?${ticketParam}`
       };
     });
     res.json({
@@ -3330,6 +3408,7 @@ app.use((req, res) => {
 // Start Server & Connect TiDB Cloud & Backblaze B2
 async function startServer() {
   await initDatabase();
+  await adminRoutes.bootstrapAdmin();
   await testB2Connection();
 
   // Run initial auto-purge of any expired documents
@@ -3350,3 +3429,5 @@ async function startServer() {
 }
 
 startServer();
+
+module.exports = app;

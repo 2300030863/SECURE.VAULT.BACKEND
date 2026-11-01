@@ -4,7 +4,7 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 async function sendTestEmail() {
   const apiKey = process.env.BREVO_API_KEY?.trim();
   const senderEmail = process.env.BREVO_SENDER_EMAIL?.trim();
-  const recipientEmail = process.argv[2] || process.env.BREVO_TEST_RECIPIENT || "siveshkommalapati965@gmail.com";
+  const recipientEmail = process.argv[2] || process.env.BREVO_TEST_RECIPIENT || "";
 
   if (!apiKey || apiKey === "YOUR_COPIED_API_KEY") {
     console.error("❌ Error: BREVO_API_KEY is not configured in backend/.env.");

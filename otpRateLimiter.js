@@ -1,19 +1,43 @@
 /**
- * In-memory OTP Rate Limiter & Cooldown Tracker
+ * Persistent OTP Rate Limiter & Cooldown Tracker
  * - Limit: 3 attempts per window
  * - On 4th attempt: 20-minute hold / lockout
+ * - Backed by TiDB Cloud MySQL `otp_rate_limits` & local JSON fallback to survive server restarts.
  */
 
-const rateLimitStore = new Map();
+const {
+  getOtpRateLimitRecord,
+  saveOtpRateLimitRecord,
+  removeOtpRateLimitRecord,
+} = require("./db");
 
-function checkOtpRateLimit(identifier, purpose = "general", maxAttempts = 3, lockoutMinutes = 20) {
+const rateLimitMemoryCache = new Map();
+
+async function checkOtpRateLimit(identifier, purpose = "general", maxAttempts = 3, lockoutMinutes = 20) {
   if (!identifier) return { allowed: true };
 
   const key = `${purpose}:${String(identifier).toLowerCase().trim()}`;
   const now = Date.now();
   const lockoutMs = lockoutMinutes * 60 * 1000;
 
-  let record = rateLimitStore.get(key);
+  let record = rateLimitMemoryCache.get(key);
+
+  // If not found in memory cache, retrieve from persistent storage
+  if (!record) {
+    try {
+      const persisted = await getOtpRateLimitRecord(key);
+      if (persisted) {
+        record = {
+          attempts: Number(persisted.attempts || 0),
+          firstAttemptAt: Number(persisted.firstAttemptAt || now),
+          lockedUntil: Number(persisted.lockedUntil || 0),
+        };
+        rateLimitMemoryCache.set(key, record);
+      }
+    } catch (err) {
+      console.warn("[OTP Rate Limiter Persistent Load Warning]:", err.message);
+    }
+  }
 
   if (record) {
     // Check if currently locked out
@@ -24,14 +48,17 @@ function checkOtpRateLimit(identifier, purpose = "general", maxAttempts = 3, loc
         allowed: false,
         locked: true,
         minutesRemaining,
-        message: `Too many OTP requests. Limit is ${maxAttempts} attempts. Please try again in ${minutesRemaining} minute${minutesRemaining === 1 ? '' : 's'}.`,
+        message: `Too many OTP requests. Limit is ${maxAttempts} attempts. Please try again in ${minutesRemaining} minute${minutesRemaining === 1 ? "" : "s"}.`,
       };
     }
 
     // If lockout has passed, reset record
     if (record.lockedUntil && record.lockedUntil <= now) {
       record = null;
-      rateLimitStore.delete(key);
+      rateLimitMemoryCache.delete(key);
+      try {
+        await removeOtpRateLimitRecord(key);
+      } catch (_) {}
     }
   }
 
@@ -41,7 +68,7 @@ function checkOtpRateLimit(identifier, purpose = "general", maxAttempts = 3, loc
       firstAttemptAt: now,
       lockedUntil: 0,
     };
-    rateLimitStore.set(key, record);
+    rateLimitMemoryCache.set(key, record);
   }
 
   // Reset if the sliding window has expired without being locked
@@ -50,9 +77,14 @@ function checkOtpRateLimit(identifier, purpose = "general", maxAttempts = 3, loc
     record.firstAttemptAt = now;
   }
 
-  // If already reached max attempts, lock out for 20 minutes
+  // If already reached max attempts, lock out for lockoutMinutes
   if (record.attempts >= maxAttempts) {
     record.lockedUntil = now + lockoutMs;
+    try {
+      await saveOtpRateLimitRecord(key, record.attempts, record.firstAttemptAt, record.lockedUntil);
+    } catch (err) {
+      console.warn("[OTP Rate Limiter Persistent Save Warning]:", err.message);
+    }
     return {
       allowed: false,
       locked: true,
@@ -64,6 +96,12 @@ function checkOtpRateLimit(identifier, purpose = "general", maxAttempts = 3, loc
   record.attempts += 1;
   const attemptsRemaining = Math.max(0, maxAttempts - record.attempts);
 
+  try {
+    await saveOtpRateLimitRecord(key, record.attempts, record.firstAttemptAt, record.lockedUntil);
+  } catch (err) {
+    console.warn("[OTP Rate Limiter Persistent Save Warning]:", err.message);
+  }
+
   return {
     allowed: true,
     locked: false,
@@ -73,16 +111,36 @@ function checkOtpRateLimit(identifier, purpose = "general", maxAttempts = 3, loc
   };
 }
 
-function resetOtpRateLimit(identifier, purpose = "general") {
+async function resetOtpRateLimit(identifier, purpose = "general") {
   if (!identifier) return;
   const key = `${purpose}:${String(identifier).toLowerCase().trim()}`;
-  rateLimitStore.delete(key);
+  rateLimitMemoryCache.delete(key);
+  try {
+    await removeOtpRateLimitRecord(key);
+  } catch (err) {
+    console.warn("[OTP Rate Limiter Reset Warning]:", err.message);
+  }
 }
 
-function getOtpRateLimitStatus(identifier, purpose = "general") {
+async function getOtpRateLimitStatus(identifier, purpose = "general") {
   if (!identifier) return { locked: false, attemptsRemaining: 3 };
   const key = `${purpose}:${String(identifier).toLowerCase().trim()}`;
-  const record = rateLimitStore.get(key);
+  let record = rateLimitMemoryCache.get(key);
+
+  if (!record) {
+    try {
+      const persisted = await getOtpRateLimitRecord(key);
+      if (persisted) {
+        record = {
+          attempts: Number(persisted.attempts || 0),
+          firstAttemptAt: Number(persisted.firstAttemptAt || Date.now()),
+          lockedUntil: Number(persisted.lockedUntil || 0),
+        };
+        rateLimitMemoryCache.set(key, record);
+      }
+    } catch (_) {}
+  }
+
   if (!record) return { locked: false, attemptsRemaining: 3 };
   const now = Date.now();
   if (record.lockedUntil && record.lockedUntil > now) {
@@ -91,7 +149,7 @@ function getOtpRateLimitStatus(identifier, purpose = "general") {
     return {
       locked: true,
       minutesRemaining,
-      message: `Too many OTP requests. Limit is 3 attempts. Locked for ${minutesRemaining} minute${minutesRemaining === 1 ? '' : 's'}.`,
+      message: `Too many OTP requests. Limit is 3 attempts. Locked for ${minutesRemaining} minute${minutesRemaining === 1 ? "" : "s"}.`,
     };
   }
   return {

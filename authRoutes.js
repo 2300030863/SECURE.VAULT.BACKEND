@@ -52,7 +52,7 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
   }
 
   // 3-Attempt OTP limit with 20-minute hold on 4th attempt
-  const rateLimitCheck = checkOtpRateLimit(email, "forgot_password", 3, 20);
+  const rateLimitCheck = await checkOtpRateLimit(email, "forgot_password", 3, 20);
   if (!rateLimitCheck.allowed) {
     return res.status(429).json({
       message: rateLimitCheck.message,
@@ -78,8 +78,9 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
 
     const user = users[0];
 
-    // Generate 6-digit OTP Code (e.g. "849201")
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    // Cryptographically secure 6-digit OTP Code (e.g. "849201")
+    const otpCode = crypto.randomInt(100000, 1000000).toString();
+    const otpHash = hashToken(otpCode);
 
     // Cryptographically secure 32 random bytes -> 64-character hex token
     const token = crypto.randomBytes(32).toString("hex");
@@ -95,10 +96,10 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
       [user.id]
     );
 
-    // Save token hash and 6-digit OTP code in TiDB Cloud
+    // Securely save token hash and hashed OTP code in TiDB Cloud
     await db.execute(
-      "INSERT INTO password_reset_tokens (user_id, email, token_hash, otp_code, expires_at) VALUES (?, ?, ?, ?, ?)",
-      [user.id, user.email.toLowerCase(), tokenHash, otpCode, expiresAtSql]
+      "INSERT INTO password_reset_tokens (user_id, email, token_hash, otp_hash, expires_at) VALUES (?, ?, ?, ?, ?)",
+      [user.id, user.email.toLowerCase(), tokenHash, otpHash, expiresAtSql]
     );
 
     // Automatically detect frontend URL from incoming request header
@@ -135,20 +136,6 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
 
     if (!emailSent) {
       const isBrevoIpBlocked = mailErrorMsg.includes("authorised_ips");
-      if (process.env.NODE_ENV !== "production") {
-        console.log(`\n🔑 [Forgot Password OTP] Code for ${user.email}: >>> ${otpCode} <<< (Expires in 15m)\n`);
-        return res.json({
-          success: true,
-          emailSent: false,
-          warning: isBrevoIpBlocked
-            ? `Brevo IP authorization needed: add your IP at https://app.brevo.com/security/authorised_ips. (Local OTP: ${otpCode})`
-            : `Email delivery issue: ${mailErrorMsg}. (Local OTP: ${otpCode})`,
-          message: `Password reset code generated! (Dev OTP: ${otpCode})`,
-          email: user.email,
-          devOtp: otpCode,
-        });
-      }
-
       await db.execute(
         "DELETE FROM password_reset_tokens WHERE token_hash = ?",
         [tokenHash]
@@ -156,9 +143,11 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
       return res.status(502).json({
         message: isBrevoIpBlocked
           ? "Brevo IP authorization needed: add your server IP in https://app.brevo.com/security/authorised_ips"
-          : `Failed to deliver email: ${mailErrorMsg}`,
+          : "Failed to deliver reset email. Please try again later.",
       });
     }
+
+    console.log(`[Forgot Password OTP] Reset code issued for ${user.email} (Expires in 15m)`);
 
     return res.json({
       success: true,
@@ -212,15 +201,16 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
     let rows = [];
 
     if (hasOtp) {
-      // Find valid record by Email + 6-Digit OTP
+      // Find valid record by Email + Hashed OTP (with fallback to plaintext otp_code for legacy tokens)
       const cleanEmail = email.trim().toLowerCase();
       const cleanOtp = otp.trim();
+      const cleanOtpHash = hashToken(cleanOtp);
 
       const [found] = await connection.execute(
         `SELECT id, user_id, email FROM password_reset_tokens 
-         WHERE LOWER(email) = ? AND otp_code = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP() 
+         WHERE LOWER(email) = ? AND (otp_hash = ? OR (otp_hash IS NULL AND otp_code = ?)) AND used_at IS NULL AND expires_at > UTC_TIMESTAMP() 
          ORDER BY id DESC LIMIT 1 FOR UPDATE`,
-        [cleanEmail, cleanOtp]
+        [cleanEmail, cleanOtpHash, cleanOtp]
       );
       rows = found;
     } else {
@@ -272,7 +262,7 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
     await connection.commit();
 
     if (resetRecord.email) {
-      resetOtpRateLimit(resetRecord.email, "forgot_password");
+      await resetOtpRateLimit(resetRecord.email, "forgot_password");
     }
 
     return res.json({

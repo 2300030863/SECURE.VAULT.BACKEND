@@ -10,6 +10,8 @@ let dbMode = "uninitialized";
 // Local storage fallback paths (strictly for local development / testing)
 const LOCAL_DB_FILE = path.join(__dirname, "local_documents.json");
 const LOCAL_USERS_FILE = path.join(__dirname, "local_users.json");
+const LOCAL_AUDIT_FILE = path.join(__dirname, "local_audit_logs.json");
+const LOCAL_OTP_LIMITS_FILE = path.join(__dirname, "local_otp_rate_limits.json");
 
 // ---------------------------------------------------------------------------
 // Local JSON Fallback Helpers (Development Only)
@@ -51,6 +53,46 @@ function saveLocalUsers(users) {
     fs.writeFileSync(LOCAL_USERS_FILE, JSON.stringify(users, null, 2), "utf8");
   } catch (err) {
     console.error("[Local DB Fallback] Error writing users file:", err.message);
+  }
+}
+
+function loadLocalAuditLogs() {
+  try {
+    if (fs.existsSync(LOCAL_AUDIT_FILE)) {
+      const data = fs.readFileSync(LOCAL_AUDIT_FILE, "utf8");
+      return JSON.parse(data);
+    }
+  } catch (err) {
+    console.error("[Local DB Fallback] Error reading audit file:", err.message);
+  }
+  return [];
+}
+
+function saveLocalAuditLogs(logs) {
+  try {
+    fs.writeFileSync(LOCAL_AUDIT_FILE, JSON.stringify(logs, null, 2), "utf8");
+  } catch (err) {
+    console.error("[Local DB Fallback] Error writing audit file:", err.message);
+  }
+}
+
+function loadLocalOtpLimits() {
+  try {
+    if (fs.existsSync(LOCAL_OTP_LIMITS_FILE)) {
+      const data = fs.readFileSync(LOCAL_OTP_LIMITS_FILE, "utf8");
+      return JSON.parse(data);
+    }
+  } catch (err) {
+    console.error("[Local DB Fallback] Error reading OTP rate limits file:", err.message);
+  }
+  return {};
+}
+
+function saveLocalOtpLimits(data) {
+  try {
+    fs.writeFileSync(LOCAL_OTP_LIMITS_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch (err) {
+    console.error("[Local DB Fallback] Error writing OTP rate limits file:", err.message);
   }
 }
 
@@ -156,6 +198,8 @@ async function initDatabase() {
           occupation VARCHAR(100) NULL,
           security_pin_hash VARCHAR(255) NULL,
           email_verified TINYINT(1) NOT NULL DEFAULT 1,
+          role VARCHAR(20) NOT NULL DEFAULT 'user',
+          status VARCHAR(20) NOT NULL DEFAULT 'active',
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
@@ -163,6 +207,19 @@ async function initDatabase() {
       await safeAddColumn(pool, "users", "occupation", "VARCHAR(100) NULL");
       await safeAddColumn(pool, "users", "security_pin_hash", "VARCHAR(255) NULL");
       await safeAddColumn(pool, "users", "email_verified", "TINYINT(1) NOT NULL DEFAULT 1");
+      await safeAddColumn(pool, "users", "role", "VARCHAR(20) NOT NULL DEFAULT 'user'");
+      await safeAddColumn(pool, "users", "status", "VARCHAR(20) NOT NULL DEFAULT 'active'");
+      await pool.query(`CREATE TABLE IF NOT EXISTS admin_audit_logs (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        admin_id BIGINT NOT NULL,
+        action VARCHAR(100) NOT NULL,
+        target_user_id BIGINT NULL,
+        details JSON NULL,
+        ip_address VARCHAR(64) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_admin_audit_created (created_at),
+        INDEX idx_admin_audit_target (target_user_id)
+      )`);
 
       await pool.query(`
         CREATE TABLE IF NOT EXISTS account_otp_tokens (
@@ -220,13 +277,14 @@ async function initDatabase() {
       await safeAddIndex(pool, "documents", "idx_expires", "(expires_at)");
       await safeAddIndex(pool, "documents", "idx_storage_mode", "(storage_mode)");
 
-      // 3. Password Reset Tokens Table (with attempt tracking & token hash)
+      // 3. Password Reset Tokens Table (with attempt tracking, token hash, and hashed OTP)
       await pool.query(`
         CREATE TABLE IF NOT EXISTS password_reset_tokens (
           id BIGINT AUTO_INCREMENT PRIMARY KEY,
           user_id BIGINT NOT NULL,
           email VARCHAR(255) NULL,
           token_hash CHAR(64) NOT NULL UNIQUE,
+          otp_hash CHAR(64) NULL,
           otp_code VARCHAR(10) NULL,
           attempt_count INT NOT NULL DEFAULT 0,
           expires_at DATETIME NOT NULL,
@@ -235,15 +293,30 @@ async function initDatabase() {
           INDEX idx_reset_user (user_id),
           INDEX idx_reset_expiry (expires_at),
           INDEX idx_reset_otp (email, otp_code),
+          INDEX idx_reset_otp_hash (email, otp_hash),
           INDEX idx_reset_token_hash (token_hash)
         );
       `);
 
+      await safeAddColumn(pool, "password_reset_tokens", "otp_hash", "CHAR(64) NULL");
       await safeAddColumn(pool, "password_reset_tokens", "otp_code", "VARCHAR(10) NULL");
       await safeAddColumn(pool, "password_reset_tokens", "email", "VARCHAR(255) NULL");
       await safeAddColumn(pool, "password_reset_tokens", "attempt_count", "INT NOT NULL DEFAULT 0");
-      await safeAddIndex(pool, "password_reset_tokens", "idx_reset_otp", "(email, otp_code)");
+      await safeAddIndex(pool, "password_reset_tokens", "idx_reset_otp_hash", "(email, otp_hash)");
       await safeAddIndex(pool, "password_reset_tokens", "idx_reset_token_hash", "(token_hash)");
+
+      // 4. Persistent OTP Rate Limiting Table (survives restarts)
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS otp_rate_limits (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          rate_key VARCHAR(191) NOT NULL UNIQUE,
+          attempts INT NOT NULL DEFAULT 0,
+          first_attempt_at BIGINT NOT NULL,
+          locked_until BIGINT NOT NULL DEFAULT 0,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_rate_key (rate_key)
+        );
+      `);
 
       isTiDBConnected = true;
       dbMode = "tidb_cloud";
@@ -275,6 +348,8 @@ async function initDatabase() {
   // Ensure local files exist for development
   if (!fs.existsSync(LOCAL_DB_FILE)) saveLocalDocs([]);
   if (!fs.existsSync(LOCAL_USERS_FILE)) saveLocalUsers([]);
+  if (!fs.existsSync(LOCAL_AUDIT_FILE)) saveLocalAuditLogs([]);
+  if (!fs.existsSync(LOCAL_OTP_LIMITS_FILE)) saveLocalOtpLimits({});
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +359,7 @@ async function findUserByEmail(email) {
   const normalizedEmail = email.toLowerCase().trim();
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, full_name, email, password_hash, occupation, security_pin_hash, email_verified, created_at FROM users WHERE LOWER(email) = ? LIMIT 1`,
+      `SELECT id, full_name, email, password_hash, occupation, security_pin_hash, email_verified, role, status, created_at FROM users WHERE LOWER(email) = ? LIMIT 1`,
       [normalizedEmail]
     );
     return rows[0] || null;
@@ -297,7 +372,7 @@ async function findUserByEmail(email) {
 async function findUserById(id) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, full_name, email, occupation, email_verified, (security_pin_hash IS NOT NULL) AS has_security_pin, created_at FROM users WHERE id = ? LIMIT 1`,
+      `SELECT id, full_name, email, occupation, email_verified, role, status, (security_pin_hash IS NOT NULL) AS has_security_pin, created_at FROM users WHERE id = ? LIMIT 1`,
       [id]
     );
     if (!rows[0]) return null;
@@ -362,6 +437,8 @@ async function createUser({ full_name, email, password_hash, occupation = null, 
       occupation: cleanOccupation,
       security_pin_hash,
       email_verified: false,
+      role: "user",
+      status: "active",
       created_at: new Date().toISOString(),
     };
     users.push(newUser);
@@ -1030,6 +1107,387 @@ async function updateDocumentAccessCode(id, newCode, newHash) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Admin Management Operations (Dual-Mode: TiDB Cloud + Local JSON Fallback)
+// ---------------------------------------------------------------------------
+
+async function forceDeleteDocument(id) {
+  if (isTiDBConnected && pool) {
+    const [result] = await pool.query(`DELETE FROM documents WHERE id = ?`, [id]);
+    return result.affectedRows > 0;
+  } else {
+    let docs = loadLocalDocs();
+    const initialLen = docs.length;
+    docs = docs.filter((d) => Number(d.id) !== Number(id));
+    saveLocalDocs(docs);
+    return docs.length < initialLen;
+  }
+}
+
+async function deleteUser(id) {
+  if (isTiDBConnected && pool) {
+    await pool.query(`DELETE FROM documents WHERE owner_id = ?`, [id]);
+    await pool.query(`DELETE FROM admin_audit_logs WHERE target_user_id = ?`, [id]);
+    const [result] = await pool.query(`DELETE FROM users WHERE id = ?`, [id]);
+    return result.affectedRows > 0;
+  } else {
+    let users = loadLocalUsers();
+    const initialLen = users.length;
+    users = users.filter((u) => Number(u.id) !== Number(id));
+    saveLocalUsers(users);
+
+    let docs = loadLocalDocs();
+    docs = docs.filter((d) => Number(d.owner_id) !== Number(id));
+    saveLocalDocs(docs);
+
+    let logs = loadLocalAuditLogs();
+    logs = logs.filter((l) => Number(l.target_user_id) !== Number(id));
+    saveLocalAuditLogs(logs);
+
+    return users.length < initialLen;
+  }
+}
+
+async function updateUserStatus(id, status) {
+  if (isTiDBConnected && pool) {
+    const [result] = await pool.query(`UPDATE users SET status = ? WHERE id = ?`, [status, id]);
+    return result.affectedRows > 0;
+  } else {
+    let users = loadLocalUsers();
+    let updated = false;
+    users = users.map((u) => {
+      if (Number(u.id) === Number(id)) {
+        updated = true;
+        return { ...u, status };
+      }
+      return u;
+    });
+    saveLocalUsers(users);
+    return updated;
+  }
+}
+
+async function updateUserRole(id, role) {
+  if (isTiDBConnected && pool) {
+    const [result] = await pool.query(`UPDATE users SET role = ? WHERE id = ?`, [role, id]);
+    return result.affectedRows > 0;
+  } else {
+    let users = loadLocalUsers();
+    let updated = false;
+    users = users.map((u) => {
+      if (Number(u.id) === Number(id)) {
+        updated = true;
+        return { ...u, role };
+      }
+      return u;
+    });
+    saveLocalUsers(users);
+    return updated;
+  }
+}
+
+async function updateUserPassword(id, passwordHash) {
+  if (isTiDBConnected && pool) {
+    const [result] = await pool.query(`UPDATE users SET password_hash = ? WHERE id = ?`, [passwordHash, id]);
+    return result.affectedRows > 0;
+  } else {
+    let users = loadLocalUsers();
+    let updated = false;
+    users = users.map((u) => {
+      if (Number(u.id) === Number(id)) {
+        updated = true;
+        return { ...u, password_hash: passwordHash };
+      }
+      return u;
+    });
+    saveLocalUsers(users);
+    return updated;
+  }
+}
+
+async function getAllUsersAdmin({ search = "", status = null, role = null, limit = 50, offset = 0 } = {}) {
+  if (isTiDBConnected && pool) {
+    const clauses = [];
+    const params = [];
+    if (search) {
+      clauses.push("(full_name LIKE ? OR email LIKE ?)");
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    if (status) {
+      clauses.push("status = ?");
+      params.push(status);
+    }
+    if (role) {
+      clauses.push("role = ?");
+      params.push(role);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const [users] = await pool.query(
+      `SELECT id, full_name, email, occupation, role, status, email_verified, created_at FROM users ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+    return users;
+  } else {
+    let users = loadLocalUsers();
+    if (search) {
+      const q = search.toLowerCase();
+      users = users.filter(
+        (u) =>
+          (u.full_name && u.full_name.toLowerCase().includes(q)) ||
+          (u.email && u.email.toLowerCase().includes(q))
+      );
+    }
+    if (status) {
+      users = users.filter((u) => (u.status || "active") === status);
+    }
+    if (role) {
+      users = users.filter((u) => (u.role || "user") === role);
+    }
+    return users.slice(offset, offset + limit).map((u) => ({
+      id: u.id,
+      full_name: u.full_name,
+      email: u.email,
+      occupation: u.occupation || null,
+      role: u.role || "user",
+      status: u.status || "active",
+      email_verified: Boolean(u.email_verified),
+      created_at: u.created_at || new Date().toISOString(),
+    }));
+  }
+}
+
+async function getAllDocumentsAdmin({ search = "", storage_mode = null, limit = 50 } = {}) {
+  if (isTiDBConnected && pool) {
+    const clauses = [];
+    const params = [];
+    if (search) {
+      clauses.push("(d.original_name LIKE ? OR u.email LIKE ?)");
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    if (storage_mode) {
+      clauses.push("d.storage_mode = ?");
+      params.push(storage_mode);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const [documents] = await pool.query(
+      `SELECT d.id, d.original_name, d.mime_type, d.file_size, d.file_count, d.storage_mode,
+              d.view_count, d.download_count, d.max_downloads, d.expires_at, d.created_at,
+              d.storage_key, u.email AS owner_email
+       FROM documents d LEFT JOIN users u ON u.id = d.owner_id
+       ${where}
+       ORDER BY d.created_at DESC LIMIT ?`,
+      [...params, limit]
+    );
+    return documents;
+  } else {
+    let docs = loadLocalDocs();
+    const users = loadLocalUsers();
+    if (search) {
+      const q = search.toLowerCase();
+      docs = docs.filter(
+        (d) =>
+          (d.original_name && d.original_name.toLowerCase().includes(q)) ||
+          (d.mime_type && d.mime_type.toLowerCase().includes(q))
+      );
+    }
+    if (storage_mode) {
+      docs = docs.filter((d) => (d.storage_mode || "online") === storage_mode);
+    }
+    return docs.slice(0, limit).map((d) => {
+      const owner = users.find((u) => Number(u.id) === Number(d.owner_id));
+      return {
+        id: d.id,
+        original_name: d.original_name,
+        mime_type: d.mime_type || "application/octet-stream",
+        file_size: d.file_size || 0,
+        file_count: d.file_count || 1,
+        storage_mode: d.storage_mode || "online",
+        view_count: d.view_count || 0,
+        download_count: d.download_count || 0,
+        max_downloads: d.max_downloads || null,
+        expires_at: d.expires_at || null,
+        created_at: d.created_at || new Date().toISOString(),
+        storage_key: d.storage_key || null,
+        owner_email: owner ? owner.email : "Anonymous / legacy",
+      };
+    });
+  }
+}
+
+async function getAdminOverview() {
+  if (isTiDBConnected && pool) {
+    const [[users]] = await pool.query(
+      "SELECT COUNT(*) AS total, SUM(status = 'active') AS active, SUM(status <> 'active') AS suspended, SUM(role = 'admin') AS admins FROM users"
+    );
+    const [[documents]] = await pool.query(
+      "SELECT COUNT(*) AS total, COALESCE(SUM(file_size), 0) AS bytes, COALESCE(SUM(view_count), 0) AS views, COALESCE(SUM(download_count), 0) AS downloads FROM documents"
+    );
+    const [[recent]] = await pool.query(
+      "SELECT COUNT(*) AS total FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
+    );
+    return {
+      users: {
+        total: Number(users?.total || 0),
+        active: Number(users?.active || 0),
+        suspended: Number(users?.suspended || 0),
+        admins: Number(users?.admins || 0),
+        new30Days: Number(recent?.total || 0),
+      },
+      documents: {
+        total: Number(documents?.total || 0),
+        storageBytes: Number(documents?.bytes || 0),
+        totalViews: Number(documents?.views || 0),
+        totalDownloads: Number(documents?.downloads || 0),
+      },
+    };
+  } else {
+    const users = loadLocalUsers();
+    const docs = loadLocalDocs();
+    const now = Date.now();
+    const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+    const new30Days = users.filter((u) => u.created_at && new Date(u.created_at).getTime() >= thirtyDaysAgo).length;
+
+    const storageBytes = docs.reduce((acc, d) => acc + (Number(d.file_size) || 0), 0);
+    const totalViews = docs.reduce((acc, d) => acc + (Number(d.view_count) || 0), 0);
+    const totalDownloads = docs.reduce((acc, d) => acc + (Number(d.download_count) || 0), 0);
+
+    return {
+      users: {
+        total: users.length,
+        active: users.filter((u) => (u.status || "active") === "active").length,
+        suspended: users.filter((u) => u.status === "suspended").length,
+        admins: users.filter((u) => u.role === "admin").length,
+        new30Days,
+      },
+      documents: {
+        total: docs.length,
+        storageBytes,
+        totalViews,
+        totalDownloads,
+      },
+    };
+  }
+}
+
+async function recordAuditLog(adminId, action, targetUserId, details, ip) {
+  if (isTiDBConnected && pool) {
+    try {
+      await pool.query(
+        "INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, ip_address) VALUES (?, ?, ?, ?, ?)",
+        [adminId, action, targetUserId || null, JSON.stringify(details || {}), String(ip || "").slice(0, 64)]
+      );
+      return;
+    } catch (e) {
+      console.error("[Audit Log Error]", e.message);
+    }
+  }
+  const logs = loadLocalAuditLogs();
+  const users = loadLocalUsers();
+  const admin = users.find((u) => Number(u.id) === Number(adminId));
+  logs.unshift({
+    id: logs.length ? Math.max(...logs.map((l) => l.id || 0)) + 1 : 1,
+    admin_id: adminId,
+    admin_email: admin ? admin.email : "admin@docqevrilo.com",
+    action,
+    target_user_id: targetUserId || null,
+    details: details || {},
+    ip_address: String(ip || "").slice(0, 64),
+    created_at: new Date().toISOString(),
+  });
+  if (logs.length > 500) logs.length = 500;
+  saveLocalAuditLogs(logs);
+}
+
+async function getAuditLogs(limit = 50) {
+  if (isTiDBConnected && pool) {
+    const [logs] = await pool.query(
+      `SELECT l.id, l.action, l.target_user_id, l.details, l.ip_address, l.created_at, u.email AS admin_email
+       FROM admin_audit_logs l JOIN users u ON u.id = l.admin_id
+       ORDER BY l.created_at DESC LIMIT ?`,
+      [limit]
+    );
+    return logs;
+  } else {
+    const logs = loadLocalAuditLogs();
+    const users = loadLocalUsers();
+    return logs.slice(0, limit).map((l) => {
+      const admin = users.find((u) => Number(u.id) === Number(l.admin_id));
+      return {
+        ...l,
+        admin_email: l.admin_email || (admin ? admin.email : "admin@docqevrilo.com"),
+      };
+    });
+  }
+}
+
+async function clearAuditLogs() {
+  if (isTiDBConnected && pool) {
+    await pool.query("DELETE FROM admin_audit_logs");
+  } else {
+    saveLocalAuditLogs([]);
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent OTP Rate Limit Storage (TiDB Cloud / Local Fallback)
+// ---------------------------------------------------------------------------
+async function getOtpRateLimitRecord(key) {
+  if (isTiDBConnected && pool) {
+    try {
+      const [rows] = await pool.query(
+        `SELECT rate_key, attempts, first_attempt_at, locked_until FROM otp_rate_limits WHERE rate_key = ? LIMIT 1`,
+        [key]
+      );
+      if (rows && rows[0]) {
+        return {
+          attempts: Number(rows[0].attempts || 0),
+          firstAttemptAt: Number(rows[0].first_attempt_at || 0),
+          lockedUntil: Number(rows[0].locked_until || 0),
+        };
+      }
+      return null;
+    } catch (err) {
+      console.warn("[TiDB OTP Rate Limit Read Warning]:", err.message);
+    }
+  }
+  const store = loadLocalOtpLimits();
+  return store[key] || null;
+}
+
+async function saveOtpRateLimitRecord(key, attempts, firstAttemptAt, lockedUntil) {
+  if (isTiDBConnected && pool) {
+    try {
+      await pool.query(
+        `INSERT INTO otp_rate_limits (rate_key, attempts, first_attempt_at, locked_until)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE attempts = VALUES(attempts), first_attempt_at = VALUES(first_attempt_at), locked_until = VALUES(locked_until)`,
+        [key, attempts, firstAttemptAt, lockedUntil]
+      );
+      return;
+    } catch (err) {
+      console.warn("[TiDB OTP Rate Limit Save Warning]:", err.message);
+    }
+  }
+  const store = loadLocalOtpLimits();
+  store[key] = { attempts, firstAttemptAt, lockedUntil };
+  saveLocalOtpLimits(store);
+}
+
+async function removeOtpRateLimitRecord(key) {
+  if (isTiDBConnected && pool) {
+    try {
+      await pool.query(`DELETE FROM otp_rate_limits WHERE rate_key = ?`, [key]);
+      return;
+    } catch (err) {
+      console.warn("[TiDB OTP Rate Limit Delete Warning]:", err.message);
+    }
+  }
+  const store = loadLocalOtpLimits();
+  delete store[key];
+  saveLocalOtpLimits(store);
+}
+
 module.exports = {
   initDatabase,
   getPool,
@@ -1048,6 +1506,20 @@ module.exports = {
   updateDocument,
   updateDocumentAccessCode,
   deleteDocument,
+  forceDeleteDocument,
+  deleteUser,
+  updateUserStatus,
+  updateUserRole,
+  updateUserPassword,
+  getAllUsersAdmin,
+  getAllDocumentsAdmin,
+  getAdminOverview,
+  recordAuditLog,
+  getAuditLogs,
+  clearAuditLogs,
+  getOtpRateLimitRecord,
+  saveOtpRateLimitRecord,
+  removeOtpRateLimitRecord,
   listRecentDocuments,
   listUserDocuments,
   findExpiredDocuments,
