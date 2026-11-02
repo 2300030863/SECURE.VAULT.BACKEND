@@ -88,6 +88,10 @@ const {
 const app = express();
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || "0.0.0.0";
+
+// Disable server technology fingerprinting
+app.disable("x-powered-by");
+
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
   if (process.env.NODE_ENV === "production") throw new Error("JWT_SECRET must be set to a random value of at least 32 characters.");
@@ -127,6 +131,15 @@ app.use(
   })
 );
 
+// Additional defense-in-depth HTTP security headers
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+  next();
+});
+
 // CORS configuration with explicit Vercel support & credential reflection
 const allowedOrigins = [
   "https://secure-vault-delta-virid.vercel.app",
@@ -159,7 +172,26 @@ app.use(
   })
 );
 
-app.use(express.json());
+// Mount DocQevrilo DeepShield Web Application Firewall (WAF)
+const { firewallMiddleware, getFirewallMetrics } = require("./firewall");
+app.use(firewallMiddleware);
+
+// Safe JSON & Form Body Parsing with payload limits to prevent ReDoS / memory exhaustion
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true, limit: "5mb" }));
+
+// Public Firewall Defense Status Endpoint
+app.get("/api/firewall/status", (_req, res) => {
+  const metrics = getFirewallMetrics();
+  res.json({
+    active: true,
+    engine: metrics.engine,
+    status: metrics.status,
+    totalBlocked: metrics.totalAttacksBlocked,
+    activeBans: metrics.activeBansCount,
+    uptimeSeconds: metrics.uptimeSeconds,
+  });
+});
 
 // Ensure private uploads & archives directories exist
 const UPLOADS_DIR = path.join(__dirname, "uploads");
@@ -443,6 +475,19 @@ app.get("/api/status", (req, res) => {
     time: new Date().toISOString(),
     database: dbStatus,
     storage: b2Status,
+  });
+});
+
+// Public System Announcement Banner Endpoint
+app.get("/api/announcement", (_req, res) => {
+  const announcement = adminRoutes.getPlatformAnnouncement
+    ? adminRoutes.getPlatformAnnouncement()
+    : { active: false, message: "" };
+  res.json({
+    active: announcement.active,
+    message: announcement.message,
+    type: announcement.type,
+    announcement,
   });
 });
 

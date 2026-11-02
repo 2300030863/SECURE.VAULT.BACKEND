@@ -24,6 +24,7 @@ const {
   clearAuditLogs,
 } = require("./db");
 const { deleteFromB2, isB2Configured, testB2Connection } = require("./b2");
+const { sendAdminCustomEmail, isEmailConfigured } = require("./mailer");
 
 const router = express.Router();
 const rawJwtSecret = process.env.JWT_SECRET;
@@ -527,4 +528,513 @@ router.delete("/audit-logs", async (req, res) => {
   }
 });
 
-module.exports = { router, bootstrapAdmin };
+// Export Audit Logs (CSV / JSON)
+router.get("/audit-logs/export", async (req, res) => {
+  try {
+    const logs = await getAuditLogs(1000);
+    const format = req.query.format === "json" ? "json" : "csv";
+
+    if (format === "json") {
+      res.setHeader("Content-Disposition", 'attachment; filename="docqevrilo-audit-logs.json"');
+      res.setHeader("Content-Type", "application/json");
+      return res.send(JSON.stringify(logs, null, 2));
+    }
+
+    // CSV format
+    const headers = ["ID", "Admin ID", "Action", "Target User ID", "IP Address", "Details", "Timestamp"];
+    const rows = logs.map((l) => [
+      l.id,
+      l.admin_id,
+      `"${(l.action || "").replace(/"/g, '""')}"`,
+      l.target_user_id || "",
+      l.ip_address || "",
+      `"${JSON.stringify(l.details || {}).replace(/"/g, '""')}"`,
+      `"${l.created_at || ""}"`,
+    ]);
+
+    const csvContent = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
+    res.setHeader("Content-Disposition", 'attachment; filename="docqevrilo-audit-logs.csv"');
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.send(csvContent);
+  } catch (err) {
+    console.error("[Admin Export Audit Error]", err.message);
+    res.status(500).json({ error: "Unable to export audit logs." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Email Communication & Broadcast Routes
+// ---------------------------------------------------------------------------
+
+function getAiConfig(customApiKey) {
+  const customKey = (customApiKey || "").trim();
+  const groqKey = (process.env.GROQ_API_KEY || "").trim();
+  const xaiKey = (process.env.XAI_API_KEY || process.env.GROK_API_KEY || process.env.GROK_KEY || "").trim();
+
+  const keyToUse = customKey || groqKey || xaiKey;
+  if (!keyToUse) return null;
+
+  // If key starts with gsk_ or GROQ_API_KEY is configured, route to Groq Cloud endpoint
+  const isGroq = keyToUse.startsWith("gsk_") || Boolean(groqKey && !customKey && !xaiKey);
+
+  if (isGroq) {
+    return {
+      provider: "groq",
+      name: "Grok AI",
+      apiKey: keyToUse,
+      endpoint: "https://api.groq.com/openai/v1/chat/completions",
+      models: ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
+      supportJsonFormat: true,
+    };
+  }
+
+  return {
+    provider: "xai",
+    name: "xAI Grok",
+    apiKey: keyToUse,
+    endpoint: "https://api.x.ai/v1/chat/completions",
+    models: ["grok-2-latest", "grok-beta"],
+    supportJsonFormat: false,
+  };
+}
+
+// Check Email API Configuration Status
+router.get("/email/status", async (_req, res) => {
+  try {
+    const configured = isEmailConfigured();
+    const aiConfig = getAiConfig();
+    res.json({
+      configured,
+      grokConfigured: Boolean(aiConfig),
+      provider: "Brevo Transactional API",
+      aiProvider: aiConfig?.name || "Grok AI",
+      senderEmail: process.env.BREVO_SENDER_EMAIL || null,
+      senderName: process.env.BREVO_SENDER_NAME || "DocQevrilo",
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to read email status." });
+  }
+});
+
+// Generate Email with Grok AI
+router.post("/email/generate-ai", async (req, res) => {
+  try {
+    const { prompt, tone = "announcement", targetAudience = "All users", customApiKey } = req.body;
+    if (!prompt || !String(prompt).trim()) {
+      return res.status(400).json({ error: "Please enter a brief or prompt for Grok AI." });
+    }
+
+    const aiConfig = getAiConfig(customApiKey);
+    if (!aiConfig) {
+      return res.status(400).json({
+        error: "Grok API Key not found. Please ensure GROQ_API_KEY or GROK_API_KEY is saved in backend/.env.",
+        needsKey: true,
+      });
+    }
+
+    const systemPrompt = `You are Grok AI, the executive AI communications specialist for DocQevrilo, a zero-knowledge end-to-end encrypted document sharing vault.
+Write high-impact, professional, obsidian-branded administrative emails.
+Your response MUST be strict valid JSON with no markdown wrapping or explanations:
+{
+  "subject": "Concise, compelling subject line (under 80 characters)",
+  "message": "Full professional body text with line breaks (\\n\\n) between paragraphs and bullet points if helpful. Do NOT use markdown # headers or HTML tags.",
+  "category": "announcement" // Choose exactly one: "announcement", "security", "maintenance", "urgent"
+}`;
+
+    const userPrompt = `Draft an administrative email based on this specification:
+Topic / Brief: ${String(prompt).trim()}
+Desired Tone: ${tone}
+Audience: ${targetAudience}
+Platform: DocQevrilo (Encrypted Vault & Secure Sharing)`;
+
+    let aiData = null;
+    let successfulModel = null;
+    let lastError = null;
+
+    // Try models in order (primary 120b -> fallback 20b -> fallback qwen)
+    for (const model of aiConfig.models) {
+      try {
+        const reqBody = {
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.7,
+        };
+
+        if (aiConfig.supportJsonFormat) {
+          reqBody.response_format = { type: "json_object" };
+        }
+
+        const res = await fetch(aiConfig.endpoint, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${aiConfig.apiKey}`,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+          },
+          body: JSON.stringify(reqBody),
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.choices?.[0]?.message?.content) {
+          aiData = data;
+          successfulModel = model;
+          break;
+        } else {
+          lastError = data.error?.message || data.message || `API error (${res.status})`;
+        }
+      } catch (err) {
+        lastError = err.message;
+      }
+    }
+
+    if (!aiData) {
+      return res.status(502).json({ error: `Grok AI Error: ${lastError || "Failed to generate email."}` });
+    }
+
+    const rawContent = aiData.choices[0].message.content || "";
+    let parsedResult = null;
+
+    try {
+      const cleaned = rawContent
+        .replace(/^```json\s*/i, "")
+        .replace(/^```\s*/i, "")
+        .replace(/\s*```$/i, "")
+        .trim();
+      parsedResult = JSON.parse(cleaned);
+    } catch (_) {
+      const lines = rawContent.split("\n").filter(Boolean);
+      parsedResult = {
+        subject: lines[0]?.replace(/^(subject:\s*|#\s*)/i, "").slice(0, 90) || "Notice from DocQevrilo Administration",
+        message: lines.slice(1).join("\n\n") || rawContent,
+        category: ["security", "maintenance", "urgent"].includes(tone) ? tone : "announcement",
+      };
+    }
+
+    const finalCategory = ["announcement", "security", "maintenance", "urgent"].includes(parsedResult.category)
+      ? parsedResult.category
+      : "announcement";
+
+    await recordAuditLog(
+      req.admin?.id || 1,
+      "email.ai_generate",
+      null,
+      { prompt: String(prompt).trim().slice(0, 100), model: successfulModel, category: finalCategory },
+      req.ip
+    );
+
+    res.json({
+      success: true,
+      subject: parsedResult.subject || "Platform Notice from DocQevrilo",
+      message: parsedResult.message || "",
+      category: finalCategory,
+      model: successfulModel,
+      provider: aiConfig.name,
+    });
+  } catch (err) {
+    console.error("[Grok AI Error]", err.message);
+    res.status(500).json({ error: err.message || "Failed to generate email with Grok AI." });
+  }
+});
+
+// Dispatch Test Email to Administrator
+router.post("/email/test", async (req, res) => {
+  try {
+    if (!isEmailConfigured()) {
+      return res.status(400).json({
+        error: "Brevo email service is not configured. Configure BREVO_API_KEY & BREVO_SENDER_EMAIL in backend environment.",
+      });
+    }
+
+    const subject = req.body.subject || "Admin Test Notification";
+    const message = req.body.message || "This is a test notification confirming that the DocQevrilo Brevo email engine is operating successfully.";
+    const category = req.body.category || "announcement";
+
+    const adminEmail = req.admin?.email || process.env.ADMIN_EMAIL || process.env.BREVO_SENDER_EMAIL;
+    if (!adminEmail) {
+      return res.status(400).json({ error: "No administrator recipient email available to receive test email." });
+    }
+
+    await sendAdminCustomEmail(adminEmail, subject, message, {
+      category,
+      recipientName: req.admin?.full_name || req.admin?.email?.split("@")[0] || "Administrator",
+    });
+
+    await recordAuditLog(req.admin?.id || 1, "email.test", null, { recipient: adminEmail }, req.ip);
+
+    res.json({
+      success: true,
+      message: `Test email successfully dispatched to ${adminEmail}.`,
+    });
+  } catch (err) {
+    console.error("[Admin Test Email Error]", err.message);
+    const isIpBlocked =
+      /unauthorized ip/i.test(err.message) ||
+      /ip.*not.*authorized/i.test(err.message) ||
+      (err.details && /ip/i.test(JSON.stringify(err.details)));
+
+    const errorMessage = isIpBlocked
+      ? "Brevo IP authorization needed: add your server IP in https://app.brevo.com/security/authorised_ips"
+      : (err.message || "Failed to dispatch test email.");
+
+    res.status(502).json({ error: errorMessage });
+  }
+});
+
+// Send Email to Selected User(s) or All Users
+router.post("/email/send", async (req, res) => {
+  try {
+    if (!isEmailConfigured()) {
+      return res.status(400).json({
+        error: "Brevo email service is not configured. Configure BREVO_API_KEY & BREVO_SENDER_EMAIL in backend environment.",
+      });
+    }
+
+    const {
+      recipientType = "all",
+      userIds,
+      selectedUserId,
+      userId,
+      subject,
+      message,
+      category = "announcement",
+    } = req.body;
+
+    if (!subject || !subject.trim()) {
+      return res.status(400).json({ error: "Email subject is required." });
+    }
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Email message content is required." });
+    }
+
+    let targetUsers = [];
+
+    if (recipientType === "selected") {
+      const candidateIds = [];
+      if (Array.isArray(userIds)) candidateIds.push(...userIds);
+      if (selectedUserId) candidateIds.push(selectedUserId);
+      if (userId) candidateIds.push(userId);
+
+      const normalizedIds = Array.from(new Set(candidateIds.map((id) => String(id).trim()))).filter(Boolean);
+
+      if (normalizedIds.length === 0) {
+        return res.status(400).json({ error: "Please select at least one recipient user." });
+      }
+
+      const allUsers = await getAllUsersAdmin({ limit: 1000 });
+      const idSet = new Set(normalizedIds);
+      targetUsers = allUsers.filter((u) => idSet.has(String(u.id)));
+    } else if (recipientType === "active") {
+      targetUsers = await getAllUsersAdmin({ status: "active", limit: 1000 });
+    } else if (recipientType === "suspended") {
+      targetUsers = await getAllUsersAdmin({ status: "suspended", limit: 1000 });
+    } else {
+      targetUsers = await getAllUsersAdmin({ limit: 1000 });
+    }
+
+    const validRecipients = targetUsers.filter((u) => u.email && u.email.includes("@"));
+
+    if (validRecipients.length === 0) {
+      return res.status(400).json({ error: "No valid user email addresses found for the selected criteria." });
+    }
+
+    let sentCount = 0;
+    let failedCount = 0;
+    const errors = [];
+
+    for (const user of validRecipients) {
+      try {
+        await sendAdminCustomEmail(user.email, subject.trim(), message.trim(), {
+          category,
+          recipientName: user.full_name || user.email.split("@")[0] || "Valued User",
+        });
+        sentCount++;
+      } catch (err) {
+        failedCount++;
+        const isIpBlocked =
+          /unauthorized ip/i.test(err.message) ||
+          /ip.*not.*authorized/i.test(err.message) ||
+          (err.details && /ip/i.test(JSON.stringify(err.details)));
+
+        const errDetail = isIpBlocked
+          ? "Brevo IP authorization needed: add your server IP in https://app.brevo.com/security/authorised_ips"
+          : err.message;
+
+        errors.push({ email: user.email, error: errDetail });
+      }
+    }
+
+    await recordAuditLog(
+      req.admin?.id || 1,
+      "email.broadcast",
+      null,
+      { recipientType, total: validRecipients.length, sentCount, failedCount, subject: subject.trim() },
+      req.ip
+    );
+
+    if (sentCount === 0 && failedCount > 0) {
+      return res.status(502).json({
+        error: errors[0]?.error || "Failed to deliver emails via Brevo.",
+        failedCount,
+        errors: errors.slice(0, 5),
+      });
+    }
+
+    res.json({
+      success: true,
+      totalRecipients: validRecipients.length,
+      sentCount,
+      failedCount,
+      errors: errors.slice(0, 5),
+      message: `Email successfully delivered to ${sentCount} user(s)${failedCount > 0 ? ` (${failedCount} failed)` : ""}.`,
+    });
+  } catch (err) {
+    console.error("[Admin Send Email Error]", err.message);
+    res.status(500).json({ error: err.message || "Failed to dispatch emails." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Platform Announcement Banner Routes
+// ---------------------------------------------------------------------------
+let platformAnnouncement = {
+  active: false,
+  message: "",
+  type: "info", // "info" | "warning" | "success" | "urgent"
+  updatedAt: new Date().toISOString(),
+  updatedBy: "Admin",
+};
+
+router.get("/announcement", (_req, res) => {
+  res.json({
+    success: true,
+    active: platformAnnouncement.active,
+    message: platformAnnouncement.message,
+    type: platformAnnouncement.type,
+    announcement: platformAnnouncement,
+  });
+});
+
+router.post("/announcement", async (req, res) => {
+  const { active, message, type } = req.body;
+  platformAnnouncement = {
+    active: Boolean(active),
+    message: String(message || "").trim().slice(0, 300),
+    type: ["info", "warning", "critical", "urgent"].includes(type) ? type : "info",
+    updatedAt: new Date().toISOString(),
+    updatedBy: req.admin?.email || "Admin",
+  };
+
+  await recordAuditLog(
+    req.admin?.id || 1,
+    "announcement.update",
+    null,
+    { active: platformAnnouncement.active, type: platformAnnouncement.type },
+    req.ip
+  );
+
+  res.json({
+    success: true,
+    active: platformAnnouncement.active,
+    message: platformAnnouncement.message,
+    type: platformAnnouncement.type,
+    announcement: platformAnnouncement,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live System Latency Diagnostics Ping
+// ---------------------------------------------------------------------------
+router.get("/diagnostics/ping", async (_req, res) => {
+  const result = {
+    database: { connected: false, latencyMs: 0 },
+    storage: { connected: false, latencyMs: 0 },
+    email: { configured: isEmailConfigured(), provider: "Brevo API" },
+  };
+
+  const dbStart = Date.now();
+  try {
+    const dbStatus = getDbStatus();
+    result.database.connected = dbStatus.isTiDBConnected;
+    result.database.mode = dbStatus.dbMode;
+    result.database.latencyMs = Date.now() - dbStart;
+  } catch (_) {
+    result.database.latencyMs = Date.now() - dbStart;
+  }
+
+  const b2Start = Date.now();
+  try {
+    const b2 = await testB2Connection();
+    result.storage.connected = b2.connected;
+    result.storage.latencyMs = Date.now() - b2Start;
+  } catch (_) {
+    result.storage.latencyMs = Date.now() - b2Start;
+  }
+
+  res.json(result);
+});
+
+// ---------------------------------------------------------------------------
+// Web Application Firewall (WAF) Admin Telemetry & Management
+// ---------------------------------------------------------------------------
+const { getFirewallMetrics, unbanIp, manualBanIp } = require("./firewall");
+
+router.get("/firewall", (_req, res) => {
+  try {
+    const metrics = getFirewallMetrics();
+    res.json({
+      success: true,
+      firewall: metrics,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to retrieve firewall telemetry." });
+  }
+});
+
+router.post("/firewall/unban", async (req, res) => {
+  try {
+    const { ip } = req.body;
+    if (!ip) {
+      return res.status(400).json({ error: "IP address is required." });
+    }
+    const unbanned = unbanIp(ip);
+    await recordAuditLog(
+      req.admin.id,
+      "FIREWALL_IP_UNBANNED",
+      null,
+      { ip, unbanned },
+      req.ip
+    );
+    res.json({ success: true, message: `IP ${ip} was removed from firewall jail.`, unbanned });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to unban IP." });
+  }
+});
+
+router.post("/firewall/ban", async (req, res) => {
+  try {
+    const { ip, reason, durationMinutes } = req.body;
+    if (!ip) {
+      return res.status(400).json({ error: "IP address is required." });
+    }
+    const incidentId = manualBanIp(ip, reason || "Manual administrative ban", Number(durationMinutes) || 60);
+    await recordAuditLog(
+      req.admin.id,
+      "FIREWALL_IP_BANNED",
+      null,
+      { ip, reason, durationMinutes, incidentId },
+      req.ip
+    );
+    res.json({ success: true, message: `IP ${ip} has been jailed.`, incidentId });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to ban IP." });
+  }
+});
+
+module.exports = {
+  router,
+  bootstrapAdmin,
+  getPlatformAnnouncement: () => platformAnnouncement,
+};

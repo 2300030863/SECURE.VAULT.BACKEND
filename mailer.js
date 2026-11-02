@@ -272,11 +272,78 @@ async function sendPinRecoveryOtpEmail(email, otpCode) {
   return { messageId: "sent", otpCode };
 }
 
+/**
+ * Sends a custom administrator notification email (or broadcast).
+ * @param {string} to - Destination email address
+ * @param {string} subject - Email subject
+ * @param {string} message - Email message body
+ * @param {object} [options] - Optional category, recipientName, etc.
+ */
+async function sendAdminCustomEmail(to, subject, message, options = {}) {
+  const category = options.category || "announcement";
+  const recipientName = options.recipientName || "DocQevrilo User";
+
+  const categoryBadgeColor =
+    category === "security" ? "#dc2626" :
+    category === "maintenance" ? "#d97706" :
+    category === "urgent" ? "#b91c1c" : "#e50936";
+
+  const categoryLabel =
+    category === "security" ? "SECURITY ADVISORY" :
+    category === "maintenance" ? "MAINTENANCE NOTICE" :
+    category === "urgent" ? "URGENT SYSTEM UPDATE" : "SYSTEM ANNOUNCEMENT";
+
+  const formattedHtmlContent = String(message || "")
+    .split(/\n\s*\n/)
+    .map((para) => `<p style="margin:0 0 14px;color:#d4d4d8;font-size:14px;line-height:1.7;">${para.replace(/\n/g, "<br/>")}</p>`)
+    .join("");
+
+  const html = `
+    <div style="background-color:#09090b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#fafafa;padding:36px 16px;">
+      <div style="max-width:580px;margin:0 auto;background:#141418;border:1px solid #27272a;border-radius:16px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,0.6);">
+        <div style="height:3px;background:linear-gradient(90deg,#e50936,#ff365c,#e50936);"></div>
+        <div style="padding:24px 28px 18px;background:#18181b;border-bottom:1px solid #27272a;">
+          <div style="margin-bottom:10px;">
+            <span style="font-size:10px;font-weight:700;letter-spacing:1px;padding:3px 8px;border-radius:4px;background:#1e1e24;color:${categoryBadgeColor};border:1px solid ${categoryBadgeColor}40;">
+              ${categoryLabel}
+            </span>
+          </div>
+          <h1 style="margin:0;font-size:20px;font-weight:700;color:#ffffff;line-height:1.3;">
+            ${subject}
+          </h1>
+        </div>
+        <div style="padding:24px 28px;">
+          <div style="font-size:13px;color:#a1a1aa;margin-bottom:16px;">
+            Hello <strong>${recipientName}</strong>,
+          </div>
+          <div style="background:#0c0c0e;border:1px solid #27272a;border-radius:12px;padding:18px;margin-bottom:18px;">
+            ${formattedHtmlContent}
+          </div>
+          <div style="background:#18181b;border:1px solid #27272a;border-radius:8px;padding:12px 14px;font-size:11px;color:#71717a;">
+            🔒 This official communication was sent by the DocQevrilo Platform Administrator. For inquiries, sign in to your dashboard.
+          </div>
+        </div>
+        <div style="padding:14px 28px;background:#0d0d10;border-top:1px solid #222226;text-align:center;font-size:11px;color:#52525b;">
+          DocQevrilo · End-to-End Cryptographic Document Exchange
+        </div>
+      </div>
+    </div>
+  `;
+
+  return await sendEmail({
+    to,
+    subject: `[DocQevrilo] ${subject}`,
+    text: `[${categoryLabel}]\n\nHello ${recipientName},\n\n${message}\n\n---\nDocQevrilo Platform Administration`,
+    html,
+  });
+}
+
 module.exports = {
   sendResetEmail,
   sendAccessCodeOtpEmail,
   sendVerificationEmail,
   sendPinRecoveryOtpEmail,
+  sendAdminCustomEmail,
   isEmailConfigured: () => isBrevoConfigured(),
   isBrevoConfigured,
 };
