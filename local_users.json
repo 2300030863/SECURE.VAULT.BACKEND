@@ -1,1 +1,14 @@
-[]
+[
+  {
+    "id": 1,
+    "full_name": "Platform Administrator",
+    "email": "admin@docqevrilo.com",
+    "password_hash": "$2b$12$5GNx.7ZVF72BP3etkwYPd.jo3RfUQuJIte4TfPJThWJqix6dwrlSu",
+    "occupation": "Administrator",
+    "security_pin_hash": null,
+    "email_verified": true,
+    "role": "admin",
+    "status": "active",
+    "created_at": "2026-11-02T12:28:15.489Z"
+  }
+]

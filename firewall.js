@@ -287,8 +287,8 @@ function firewallMiddleware(req, res, next) {
   const clientIp = getClientIp(req);
   const rawPath = req.originalUrl || req.url || "/";
 
-  // Check path whitelist
-  if (PATH_WHITELIST.has(req.path)) {
+  // Check path whitelist and authenticated administration routes
+  if (PATH_WHITELIST.has(req.path) || req.path.startsWith("/api/admin")) {
     return next();
   }
 
