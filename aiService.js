@@ -9,18 +9,25 @@
 const pdfParse = require("pdf-parse");
 const AdmZip = require("adm-zip");
 const mammoth = require("mammoth");
+let XLSX = null;
+try {
+  XLSX = require("xlsx");
+} catch (_) {}
 require("dotenv").config();
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const CANDIDATE_MODELS = Array.from(
   new Set([
     process.env.GROQ_MODEL,
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b",
-    "qwen/qwen3.8-27b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
   ].filter(Boolean))
 );
-const ACTIVE_MODEL = CANDIDATE_MODELS[0] || "openai/gpt-oss-20b";
+const ACTIVE_MODEL = CANDIDATE_MODELS[0] || "llama-3.3-70b-versatile";
 let lastSuccessfulModel = ACTIVE_MODEL;
 
 // In-memory caches for extracted text, summaries, and generated quizzes
@@ -271,7 +278,260 @@ async function extractPptxText(pptxBuffer, filename = "presentation.pptx") {
 }
 
 /**
- * Extract clean, chunked text from a document or ZIP archive
+ * Extract clean text and tabular sheets from Excel files (.xlsx, .xls)
+ * @param {Buffer} buffer - Excel file buffer
+ * @param {string} filename - Filename for display and metadata
+ */
+function extractExcelText(buffer, filename = "spreadsheet.xlsx") {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) {
+    return { fullText: "", chunks: [] };
+  }
+
+  try {
+    if (!XLSX) {
+      XLSX = require("xlsx");
+    }
+    const workbook = XLSX.read(buffer, { type: "buffer" });
+    const chunks = [];
+    let fullText = "";
+
+    workbook.SheetNames.forEach((sheetName, idx) => {
+      const sheet = workbook.Sheets[sheetName];
+      const csv = XLSX.utils.sheet_to_csv(sheet);
+      if (csv && csv.trim()) {
+        const sheetText = `### Sheet: ${sheetName}\n${csv.trim()}`;
+        fullText += (fullText ? "\n\n" : "") + sheetText;
+        chunks.push({
+          pageNum: idx + 1,
+          label: `${filename} - Sheet: ${sheetName}`,
+          text: sheetText,
+        });
+      }
+    });
+
+    if (!fullText.trim()) {
+      fullText = `[Spreadsheet: ${filename}]\nContains worksheets with no tabular rows.`;
+      chunks.push({
+        pageNum: 1,
+        label: `${filename} (Spreadsheet)`,
+        text: fullText,
+      });
+    }
+
+    return { fullText: fullText.trim(), chunks };
+  } catch (err) {
+    console.warn(`[Excel Extraction Warning for ${filename}]:`, err.message);
+    const fallbackText = `[Spreadsheet Document: ${filename}]\nFile Size: ${(buffer.length / 1024).toFixed(1)} KB\nNote: Excel data workbook stored in DocQevrilo Vault.`;
+    return {
+      fullText: fallbackText,
+      chunks: [{ pageNum: 1, label: `${filename} (Excel)`, text: fallbackText }],
+    };
+  }
+}
+
+/**
+ * Analyze an image buffer using Groq Vision API (llama-3.2-11b-vision-preview / llama-3.2-90b-vision-preview)
+ * Extracts OCR text, diagrams, labels, and scene descriptions.
+ * Falls back to structured visual metadata when offline or on API timeout.
+ */
+async function analyzeImageBuffer(imageBuffer, filename = "image.png", mimeType = "image/jpeg") {
+  if (!imageBuffer || !Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
+    return { fullText: "", chunks: [] };
+  }
+
+  let determinedMime = mimeType;
+  const lowerName = filename.toLowerCase();
+  if (lowerName.endsWith(".png")) determinedMime = "image/png";
+  else if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) determinedMime = "image/jpeg";
+  else if (lowerName.endsWith(".webp")) determinedMime = "image/webp";
+  else if (lowerName.endsWith(".gif")) determinedMime = "image/gif";
+  else if (lowerName.endsWith(".bmp")) determinedMime = "image/bmp";
+  else if (lowerName.endsWith(".svg")) determinedMime = "image/svg+xml";
+
+  const apiKey = getGroqApiKey();
+  let extractedText = "";
+
+  if (apiKey) {
+    const visionModels = [
+      "llama-3.2-11b-vision-preview",
+      "llama-3.2-90b-vision-preview",
+    ];
+
+    try {
+      const base64Data = imageBuffer.toString("base64");
+      const dataUri = `data:${determinedMime};base64,${base64Data}`;
+
+      for (const model of visionModels) {
+        try {
+          const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "text",
+                      text: `Analyze this image "${filename}" thoroughly for academic study and document analysis:
+1. Extract ALL visible text, labels, numbers, tables, code, diagrams, headings, and annotations verbatim.
+2. If the image depicts diagrams, charts, UI screenshots, schematics, or photos, describe all components, relationships, workflows, and key takeaways in detail.
+3. Structure your response clearly with headings:
+   - Extracted Text & Content
+   - Visual Structure & Diagrams
+   - Key Insights & Observations`,
+                    },
+                    {
+                      type: "image_url",
+                      image_url: {
+                        url: dataUri,
+                      },
+                    },
+                  ],
+                },
+              ],
+              temperature: 0.15,
+              max_tokens: 2500,
+            }),
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            const content = data.choices?.[0]?.message?.content?.trim();
+            if (content) {
+              extractedText = content;
+              lastSuccessfulModel = model;
+              console.log(`[Groq Vision] Successfully extracted image content from "${filename}" using ${model}.`);
+              break;
+            }
+          } else {
+            const errData = await response.json().catch(() => ({}));
+            console.warn(`[Groq Vision Warning on ${model}]:`, errData.error?.message || response.statusText);
+          }
+        } catch (subErr) {
+          console.warn(`[Groq Vision Network Warning on ${model}]:`, subErr.message);
+        }
+      }
+    } catch (encErr) {
+      console.warn(`[Groq Vision Encoding Warning for ${filename}]:`, encErr.message);
+    }
+  }
+
+  // Graceful fallback representation if Groq Vision is unavailable, rate-limited, or offline
+  if (!extractedText.trim()) {
+    const sizeKb = (imageBuffer.length / 1024).toFixed(1);
+    extractedText = `[Image Analysis: ${filename}]\nFormat: ${determinedMime}\nFile Size: ${sizeKb} KB\nStatus: Visual media document preserved in secure DocQevrilo Vault.\nNote: Image visual asset indexed and ready for viewing and inspection.`;
+  }
+
+  const textChunks = chunkTextBySections(extractedText, 3500);
+  const chunks = textChunks.map((tc, idx) => ({
+    pageNum: idx + 1,
+    label: textChunks.length > 1 ? `${filename} (Image Part ${idx + 1})` : `${filename} (Image)`,
+    text: tc.text,
+  }));
+
+  return { fullText: extractedText, chunks };
+}
+
+/**
+ * Transcribe an audio buffer using Groq Whisper API (whisper-large-v3-turbo / whisper-large-v3)
+ * Splits transcription into time-stamped sections and chunks.
+ * Falls back to structured audio metadata when offline or on API timeout.
+ */
+async function transcribeAudioBuffer(audioBuffer, filename = "recording.mp3", mimeType = "audio/mpeg") {
+  if (!audioBuffer || !Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
+    return { fullText: "", chunks: [] };
+  }
+
+  let determinedMime = mimeType;
+  const lowerName = filename.toLowerCase();
+  if (lowerName.endsWith(".mp3")) determinedMime = "audio/mpeg";
+  else if (lowerName.endsWith(".wav")) determinedMime = "audio/wav";
+  else if (lowerName.endsWith(".m4a")) determinedMime = "audio/m4a";
+  else if (lowerName.endsWith(".ogg")) determinedMime = "audio/ogg";
+  else if (lowerName.endsWith(".flac")) determinedMime = "audio/flac";
+  else if (lowerName.endsWith(".aac")) determinedMime = "audio/aac";
+  else if (lowerName.endsWith(".webm")) determinedMime = "audio/webm";
+
+  const apiKey = getGroqApiKey();
+  let transcriptText = "";
+  const chunks = [];
+
+  if (apiKey) {
+    const whisperModels = [
+      "whisper-large-v3-turbo",
+      "whisper-large-v3",
+    ];
+
+    for (const model of whisperModels) {
+      try {
+        const formData = new FormData();
+        const blob = new Blob([audioBuffer], { type: determinedMime });
+        formData.append("file", blob, filename);
+        formData.append("model", model);
+        formData.append("response_format", "verbose_json");
+
+        const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: formData,
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.segments && Array.isArray(data.segments) && data.segments.length > 0) {
+            const formattedSegments = data.segments.map((seg) => {
+              const startMin = Math.floor(seg.start / 60);
+              const startSec = Math.floor(seg.start % 60);
+              const timestamp = `[${String(startMin).padStart(2, "0")}:${String(startSec).padStart(2, "0")}]`;
+              return `${timestamp} ${seg.text.trim()}`;
+            });
+            transcriptText = formattedSegments.join("\n");
+            console.log(`[Groq Whisper] Successfully transcribed audio "${filename}" with timestamps using ${model}.`);
+            break;
+          } else if (data.text && data.text.trim()) {
+            transcriptText = data.text.trim();
+            console.log(`[Groq Whisper] Successfully transcribed audio "${filename}" using ${model}.`);
+            break;
+          }
+        } else {
+          const errData = await response.json().catch(() => ({}));
+          console.warn(`[Groq Whisper Warning on ${model}]:`, errData.error?.message || response.statusText);
+        }
+      } catch (err) {
+        console.warn(`[Groq Whisper Network Warning on ${model}]:`, err.message);
+      }
+    }
+  }
+
+  // Graceful fallback representation if Whisper is unavailable, rate-limited, or offline
+  if (!transcriptText.trim()) {
+    const sizeKb = (audioBuffer.length / 1024).toFixed(1);
+    transcriptText = `[Audio Recording: ${filename}]\nFormat: ${determinedMime}\nFile Size: ${sizeKb} KB\nStatus: Spoken audio track stored securely in DocQevrilo Vault.\nNote: Audio asset preserved for streaming and review.`;
+  }
+
+  const textChunks = chunkTextBySections(transcriptText, 3500);
+  textChunks.forEach((tc, idx) => {
+    chunks.push({
+      pageNum: idx + 1,
+      label: textChunks.length > 1 ? `${filename} (Track Part ${idx + 1})` : `${filename} (Audio Transcript)`,
+      text: tc.text,
+    });
+  });
+
+  return { fullText: transcriptText, chunks };
+}
+
+/**
+ * Extract clean, chunked text from any document, image, audio, or ZIP archive
+ * Recursively inspects nested ZIP files, executes Groq Vision on images,
+ * Groq Whisper on audio, and sheet parsing on Excel files.
  * @param {Buffer} buffer - File buffer
  * @param {string} originalName - Original filename
  * @param {string} mimeType - MIME type
@@ -282,9 +542,23 @@ async function extractDocumentText(buffer, originalName = "", mimeType = "") {
     throw new Error("Cannot extract text from an empty document buffer.");
   }
 
+  const lowerName = (originalName || "").toLowerCase();
+  const isOfficeDoc =
+    lowerName.endsWith(".docx") ||
+    lowerName.endsWith(".doc") ||
+    lowerName.endsWith(".pptx") ||
+    lowerName.endsWith(".xlsx") ||
+    lowerName.endsWith(".xls") ||
+    mimeType.includes("word") ||
+    mimeType.includes("presentation") ||
+    mimeType.includes("spreadsheet") ||
+    mimeType.includes("excel");
+
   const isZip =
-    originalName.toLowerCase().endsWith(".zip") ||
-    (buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b);
+    !isOfficeDoc &&
+    (lowerName.endsWith(".zip") ||
+      mimeType.includes("zip") ||
+      (buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b));
 
   let fullText = "";
   const chunks = [];
@@ -306,37 +580,114 @@ async function extractDocumentText(buffer, originalName = "", mimeType = "") {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       const cleanName = entry.entryName.replace(/^(\d+_)+/, "");
-      const lowerName = cleanName.toLowerCase();
+      const entryLower = cleanName.toLowerCase();
       const entryData = entry.getData();
 
       try {
-        if (lowerName.endsWith(".pdf")) {
+        const isEntryOffice =
+          entryLower.endsWith(".docx") ||
+          entryLower.endsWith(".doc") ||
+          entryLower.endsWith(".pptx") ||
+          entryLower.endsWith(".xlsx") ||
+          entryLower.endsWith(".xls");
+
+        const isEntryZip =
+          !isEntryOffice &&
+          (entryLower.endsWith(".zip") ||
+            (entryData.length >= 4 && entryData[0] === 0x50 && entryData[1] === 0x4b));
+
+        if (isEntryZip) {
+          // Nested ZIP archive! Recursively unpack and process all files inside
+          const zipRes = await extractDocumentText(entryData, cleanName, "application/zip");
+          if (zipRes.chunks && zipRes.chunks.length > 0) {
+            chunks.push(...zipRes.chunks);
+          }
+          if (zipRes.fullText && zipRes.fullText.trim()) {
+            fullText += `\n\n--- Archive: ${cleanName} ---\n${zipRes.fullText}`;
+          }
+        } else if (entryLower.endsWith(".pdf")) {
           const pdfRes = await extractPdfText(entryData, cleanName);
           chunks.push(...pdfRes.chunks);
           fullText += `\n\n--- File: ${cleanName} ---\n${pdfRes.fullText}`;
-        } else if (lowerName.endsWith(".docx") || lowerName.endsWith(".doc")) {
+        } else if (entryLower.endsWith(".docx") || entryLower.endsWith(".doc")) {
           const docxRes = await extractDocxText(entryData, cleanName);
           chunks.push(...docxRes.chunks);
           fullText += `\n\n--- File: ${cleanName} ---\n${docxRes.fullText}`;
-        } else if (lowerName.endsWith(".pptx")) {
+        } else if (entryLower.endsWith(".pptx")) {
           const pptxRes = await extractPptxText(entryData, cleanName);
           chunks.push(...pptxRes.chunks);
           fullText += `\n\n--- File: ${cleanName} ---\n${pptxRes.fullText}`;
+        } else if (entryLower.endsWith(".xlsx") || entryLower.endsWith(".xls")) {
+          const xlsRes = extractExcelText(entryData, cleanName);
+          chunks.push(...xlsRes.chunks);
+          fullText += `\n\n--- Spreadsheet: ${cleanName} ---\n${xlsRes.fullText}`;
         } else if (
-          lowerName.endsWith(".txt") ||
-          lowerName.endsWith(".md") ||
-          lowerName.endsWith(".json") ||
-          lowerName.endsWith(".csv") ||
-          lowerName.endsWith(".log") ||
-          lowerName.endsWith(".js") ||
-          lowerName.endsWith(".ts") ||
-          lowerName.endsWith(".py") ||
-          lowerName.endsWith(".java") ||
-          lowerName.endsWith(".c") ||
-          lowerName.endsWith(".cpp") ||
-          lowerName.endsWith(".sql")
+          entryLower.endsWith(".png") ||
+          entryLower.endsWith(".jpg") ||
+          entryLower.endsWith(".jpeg") ||
+          entryLower.endsWith(".webp") ||
+          entryLower.endsWith(".gif") ||
+          entryLower.endsWith(".bmp") ||
+          entryLower.endsWith(".svg") ||
+          entryLower.endsWith(".tiff")
         ) {
-          const text = entryData.toString("utf8").trim();
+          const imgRes = await analyzeImageBuffer(entryData, cleanName);
+          chunks.push(...imgRes.chunks);
+          fullText += `\n\n--- Image: ${cleanName} ---\n${imgRes.fullText}`;
+        } else if (
+          entryLower.endsWith(".mp3") ||
+          entryLower.endsWith(".wav") ||
+          entryLower.endsWith(".m4a") ||
+          entryLower.endsWith(".ogg") ||
+          entryLower.endsWith(".flac") ||
+          entryLower.endsWith(".aac") ||
+          entryLower.endsWith(".webm") ||
+          entryLower.endsWith(".wma")
+        ) {
+          const audioRes = await transcribeAudioBuffer(entryData, cleanName);
+          chunks.push(...audioRes.chunks);
+          fullText += `\n\n--- Audio: ${cleanName} ---\n${audioRes.fullText}`;
+        } else if (
+          entryLower.endsWith(".txt") ||
+          entryLower.endsWith(".md") ||
+          entryLower.endsWith(".json") ||
+          entryLower.endsWith(".csv") ||
+          entryLower.endsWith(".tsv") ||
+          entryLower.endsWith(".log") ||
+          entryLower.endsWith(".js") ||
+          entryLower.endsWith(".ts") ||
+          entryLower.endsWith(".jsx") ||
+          entryLower.endsWith(".tsx") ||
+          entryLower.endsWith(".py") ||
+          entryLower.endsWith(".java") ||
+          entryLower.endsWith(".c") ||
+          entryLower.endsWith(".cpp") ||
+          entryLower.endsWith(".h") ||
+          entryLower.endsWith(".cs") ||
+          entryLower.endsWith(".go") ||
+          entryLower.endsWith(".rs") ||
+          entryLower.endsWith(".sql") ||
+          entryLower.endsWith(".html") ||
+          entryLower.endsWith(".css") ||
+          entryLower.endsWith(".yaml") ||
+          entryLower.endsWith(".yml") ||
+          entryLower.endsWith(".xml") ||
+          entryLower.endsWith(".rtf") ||
+          entryLower.endsWith(".sh") ||
+          entryLower.endsWith(".bat")
+        ) {
+          let text = entryData.toString("utf8");
+          if (entryLower.endsWith(".rtf")) {
+            text = text
+              .replace(/\\(rtf1|ansi|deff0|fonttbl|colortbl|stylesheet|info|listtable|listoverridetable)[^{]*\{[\s\S]*?\}/gi, "")
+              .replace(/[{}\\]/g, " ")
+              .replace(/\\[a-z0-9]+\s?/gi, " ")
+              .replace(/\s+/g, " ")
+              .trim();
+          } else {
+            text = text.trim();
+          }
+
           if (text) {
             const fileChunks = chunkTextBySections(text, 4000);
             fileChunks.forEach((fc) => {
@@ -348,6 +699,16 @@ async function extractDocumentText(buffer, originalName = "", mimeType = "") {
             });
             fullText += `\n\n--- File: ${cleanName} ---\n${text}`;
           }
+        } else {
+          // Unknown or binary file entry
+          const sizeKb = (entryData.length / 1024).toFixed(1);
+          const metaText = `[File Asset: ${cleanName} - Size: ${sizeKb} KB - Stored in Vault]`;
+          chunks.push({
+            pageNum: chunks.length + 1,
+            label: cleanName,
+            text: metaText,
+          });
+          fullText += `\n\n--- File: ${cleanName} ---\n${metaText}`;
         }
       } catch (err) {
         console.warn(`[Extraction Warning for ${cleanName}]:`, err.message);
@@ -357,10 +718,12 @@ async function extractDocumentText(buffer, originalName = "", mimeType = "") {
 
     if (!fullText.trim()) {
       const errorDetails = errors.length > 0 ? ` Details: ${errors.join("; ")}` : "";
-      throw new Error(
-        `No readable text could be extracted from archive "${originalName}".${errorDetails} ` +
-        `Please ensure your document contains selectable text.`
-      );
+      fullText = `[Archive: ${originalName}]\nContains ${entries.length} items preserved in DocQevrilo Vault.${errorDetails}`;
+      chunks.push({
+        pageNum: 1,
+        label: `${originalName} (Archive)`,
+        text: fullText,
+      });
     }
   } else {
     // Single non-zip buffer
@@ -377,17 +740,75 @@ async function extractDocumentText(buffer, originalName = "", mimeType = "") {
       const pptxRes = await extractPptxText(buffer, originalName);
       fullText = pptxRes.fullText;
       chunks.push(...pptxRes.chunks);
+    } else if (
+      lowerName.endsWith(".xlsx") ||
+      lowerName.endsWith(".xls") ||
+      mimeType.includes("spreadsheet") ||
+      mimeType.includes("excel")
+    ) {
+      const xlsRes = extractExcelText(buffer, originalName);
+      fullText = xlsRes.fullText;
+      chunks.push(...xlsRes.chunks);
+    } else if (
+      lowerName.endsWith(".png") ||
+      lowerName.endsWith(".jpg") ||
+      lowerName.endsWith(".jpeg") ||
+      lowerName.endsWith(".webp") ||
+      lowerName.endsWith(".gif") ||
+      lowerName.endsWith(".bmp") ||
+      lowerName.endsWith(".svg") ||
+      mimeType.startsWith("image/")
+    ) {
+      const imgRes = await analyzeImageBuffer(buffer, originalName, mimeType);
+      fullText = imgRes.fullText;
+      chunks.push(...imgRes.chunks);
+    } else if (
+      lowerName.endsWith(".mp3") ||
+      lowerName.endsWith(".wav") ||
+      lowerName.endsWith(".m4a") ||
+      lowerName.endsWith(".ogg") ||
+      lowerName.endsWith(".flac") ||
+      lowerName.endsWith(".aac") ||
+      lowerName.endsWith(".webm") ||
+      lowerName.endsWith(".wma") ||
+      mimeType.startsWith("audio/")
+    ) {
+      const audioRes = await transcribeAudioBuffer(buffer, originalName, mimeType);
+      fullText = audioRes.fullText;
+      chunks.push(...audioRes.chunks);
     } else {
-      // Plain text or code
-      const text = buffer.toString("utf8").trim();
-      const nonWhitespace = text.replace(/\s+/g, "").length;
-      if (nonWhitespace < 20) {
-        throw new Error(`The document "${originalName}" does not contain sufficient readable text.`);
+      // Plain text, code, or RTF
+      let text = buffer.toString("utf8");
+      if (lowerName.endsWith(".rtf")) {
+        text = text
+          .replace(/\\(rtf1|ansi|deff0|fonttbl|colortbl|stylesheet|info|listtable|listoverridetable)[^{]*\{[\s\S]*?\}/gi, "")
+          .replace(/[{}\\]/g, " ")
+          .replace(/\\[a-z0-9]+\s?/gi, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+      } else {
+        text = text.trim();
       }
-      fullText = text;
-      const textChunks = chunkTextBySections(text, 4000);
-      chunks.push(...textChunks);
+
+      if (text.length >= 10) {
+        fullText = text;
+        const textChunks = chunkTextBySections(text, 4000);
+        chunks.push(...textChunks);
+      } else {
+        const sizeKb = (buffer.length / 1024).toFixed(1);
+        fullText = `[Document: ${originalName} - Size: ${sizeKb} KB - Stored in Vault]`;
+        chunks.push({ pageNum: 1, label: originalName, text: fullText });
+      }
     }
+  }
+
+  if (!fullText.trim()) {
+    fullText = `[Vault Document: ${originalName}]\nDocument stored securely in DocQevrilo Vault.`;
+    chunks.push({
+      pageNum: 1,
+      label: originalName,
+      text: fullText,
+    });
   }
 
   return { fullText: fullText.trim(), chunks };

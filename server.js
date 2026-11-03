@@ -3314,9 +3314,9 @@ app.get("/api/ai/status", optionalAuth, (req, res) => {
   res.json({
     enabled: Boolean(apiKey),
     provider: "Groq Cloud",
-    model: process.env.GROQ_MODEL || "qwen/qwen3.8-27b",
-    fallbackModel: "openai/gpt-oss-120b",
-    features: ["summarizer", "ask_ai", "quiz_generator"],
+    model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+    fallbackModel: "llama-3.1-8b-instant",
+    features: ["summarizer", "ask_ai", "quiz_generator", "vision_ocr", "audio_transcription", "archive_deep_scan"],
   });
 });
 
@@ -3352,9 +3352,9 @@ app.post("/api/ai/documents/:id/summary", optionalAuth, accessLimiter, async (re
 
     const { fullText } = await getDocumentExtractedText(doc, refresh);
 
-    if (!fullText || fullText.length < 20) {
+    if (!fullText || !fullText.trim()) {
       return res.status(400).json({
-        error: "This document contains no readable text to summarize (it may be an image or binary archive).",
+        error: "This document contains no readable text to summarize.",
       });
     }
 
@@ -3381,7 +3381,7 @@ app.post("/api/ai/documents/:id/chat", optionalAuth, accessLimiter, async (req, 
     }
 
     const { fullText, chunks } = await getDocumentExtractedText(doc);
-    if (!fullText || fullText.length < 20) {
+    if (!fullText || !fullText.trim()) {
       return res.status(400).json({
         error: "This document contains no readable text for answering questions.",
       });
@@ -3406,7 +3406,7 @@ app.post("/api/ai/documents/:id/quiz", optionalAuth, accessLimiter, async (req, 
     const { topic, difficulty, questionCount } = req.body || {};
 
     const { fullText } = await getDocumentExtractedText(doc);
-    if (!fullText || fullText.length < 20) {
+    if (!fullText || !fullText.trim()) {
       return res.status(400).json({
         error: "This document contains no readable text to generate quiz questions from.",
       });

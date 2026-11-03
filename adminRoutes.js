@@ -637,14 +637,15 @@ router.post("/email/generate-ai", async (req, res) => {
       });
     }
 
-    const systemPrompt = `You are Grok AI, the executive AI communications specialist for DocQevrilo, a zero-knowledge end-to-end encrypted document sharing vault.
+    const systemPrompt = `You are an executive AI communications specialist for DocQevrilo, a zero-knowledge end-to-end encrypted document sharing vault.
 Write high-impact, professional, obsidian-branded administrative emails.
-Your response MUST be strict valid JSON with no markdown wrapping or explanations:
+Your response MUST be a valid JSON object without any commentary or markdown code fences:
 {
   "subject": "Concise, compelling subject line (under 80 characters)",
-  "message": "Full professional body text with line breaks (\\n\\n) between paragraphs and bullet points if helpful. Do NOT use markdown # headers or HTML tags.",
-  "category": "announcement" // Choose exactly one: "announcement", "security", "maintenance", "urgent"
-}`;
+  "message": "Full professional body text with line breaks (\\n\\n) between paragraphs. Do NOT use markdown # headers or HTML tags.",
+  "category": "announcement"
+}
+Valid values for category are: "announcement", "security", "maintenance", "urgent".`;
 
     const userPrompt = `Draft an administrative email based on this specification:
 Topic / Brief: ${String(prompt).trim()}
@@ -656,7 +657,7 @@ Platform: DocQevrilo (Encrypted Vault & Secure Sharing)`;
     let successfulModel = null;
     let lastError = null;
 
-    // Try models in order (primary 120b -> fallback 20b -> fallback qwen)
+    // Try models in order
     for (const model of aiConfig.models) {
       try {
         const reqBody = {
@@ -668,7 +669,7 @@ Platform: DocQevrilo (Encrypted Vault & Secure Sharing)`;
           temperature: 0.7,
         };
 
-        if (aiConfig.supportJsonFormat) {
+        if (aiConfig.supportJsonFormat && (model.includes("llama-3") || model.includes("gpt"))) {
           reqBody.response_format = { type: "json_object" };
         }
 
@@ -716,13 +717,15 @@ Platform: DocQevrilo (Encrypted Vault & Secure Sharing)`;
 
       const finalCategory = ["security", "maintenance", "urgent"].includes(tone) ? tone : "announcement";
 
-      await recordAuditLog(
-        req.admin?.id || 1,
-        "email.ai_generate",
-        null,
-        { prompt: String(prompt).trim().slice(0, 100), model: "offline-ai-engine", category: finalCategory },
-        req.ip
-      );
+      try {
+        await recordAuditLog(
+          req.admin?.id || 1,
+          "email.ai_generate",
+          null,
+          { prompt: String(prompt).trim().slice(0, 100), model: "offline-ai-engine", category: finalCategory },
+          req.ip
+        );
+      } catch (_) {}
 
       return res.json({
         success: true,
@@ -734,44 +737,83 @@ Platform: DocQevrilo (Encrypted Vault & Secure Sharing)`;
       });
     }
 
-    const rawContent = aiData.choices[0].message.content || "";
+    const rawContent = aiData.choices[0]?.message?.content || "";
     let parsedResult = null;
 
     try {
-      const cleaned = rawContent
+      let cleaned = rawContent
         .replace(/^```json\s*/i, "")
         .replace(/^```\s*/i, "")
         .replace(/\s*```$/i, "")
         .trim();
+
+      const firstBrace = cleaned.indexOf("{");
+      const lastBrace = cleaned.lastIndexOf("}");
+      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+      }
+      cleaned = cleaned.replace(/\/\/.*$/gm, "");
       parsedResult = JSON.parse(cleaned);
     } catch (_) {
-      const lines = rawContent.split("\n").filter(Boolean);
+      const subjectMatch = rawContent.match(/"subject"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/i);
+      const messageMatch = rawContent.match(/"message"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/i);
+      const categoryMatch = rawContent.match(/"category"\s*:\s*"([^"\\]*)"/i);
+
+      const lines = rawContent.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
       parsedResult = {
-        subject: lines[0]?.replace(/^(subject:\s*|#\s*)/i, "").slice(0, 90) || "Notice from DocQevrilo Administration",
-        message: lines.slice(1).join("\n\n") || rawContent,
-        category: ["security", "maintenance", "urgent"].includes(tone) ? tone : "announcement",
+        subject: subjectMatch
+          ? subjectMatch[1].replace(/\\"/g, '"')
+          : lines[0] && !lines[0].startsWith("{")
+          ? lines[0].replace(/^(subject:\s*|#\s*)/i, "")
+          : `DocQevrilo Update: ${String(prompt).slice(0, 40)}`,
+        message: messageMatch
+          ? messageMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"')
+          : lines.slice(1).join("\n\n") || rawContent,
+        category: categoryMatch
+          ? categoryMatch[1]
+          : ["security", "maintenance", "urgent"].includes(tone)
+          ? tone
+          : "announcement",
       };
     }
 
-    const finalCategory = ["announcement", "security", "maintenance", "urgent"].includes(parsedResult.category)
+    const finalSubject =
+      parsedResult?.subject ||
+      parsedResult?.title ||
+      parsedResult?.email_subject ||
+      `DocQevrilo Platform Notice`;
+
+    const finalMessage =
+      parsedResult?.message ||
+      parsedResult?.body ||
+      parsedResult?.content ||
+      parsedResult?.text ||
+      parsedResult?.email_body ||
+      "";
+
+    const finalCategory = ["announcement", "security", "maintenance", "urgent"].includes(parsedResult?.category)
       ? parsedResult.category
+      : ["announcement", "security", "maintenance", "urgent"].includes(tone)
+      ? tone
       : "announcement";
 
-    await recordAuditLog(
-      req.admin?.id || 1,
-      "email.ai_generate",
-      null,
-      { prompt: String(prompt).trim().slice(0, 100), model: successfulModel, category: finalCategory },
-      req.ip
-    );
+    try {
+      await recordAuditLog(
+        req.admin?.id || 1,
+        "email.ai_generate",
+        null,
+        { prompt: String(prompt).trim().slice(0, 100), model: successfulModel, category: finalCategory },
+        req.ip
+      );
+    } catch (_) {}
 
-    res.json({
+    return res.json({
       success: true,
-      subject: parsedResult.subject || "Platform Notice from DocQevrilo",
-      message: parsedResult.message || "",
+      subject: finalSubject,
+      message: finalMessage,
       category: finalCategory,
       model: successfulModel,
-      provider: aiConfig.name,
+      provider: aiConfig.name || "Groq AI",
     });
   } catch (err) {
     console.error("[Grok AI Error]", err.message);
