@@ -122,6 +122,10 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
     resetUrl.searchParams.set("token", token);
     resetUrl.searchParams.set("email", user.email);
 
+    console.log(`\n======================================================`);
+    console.log(`🔑 [FORGOT PASSWORD OTP] Code for ${user.email}: [ ${otpCode} ]`);
+    console.log(`======================================================\n`);
+
     let mailResult;
     let emailSent = false;
     let mailErrorMsg = "";
@@ -136,6 +140,20 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
 
     if (!emailSent) {
       const isBrevoIpBlocked = mailErrorMsg.includes("authorised_ips");
+      const isLocalDev = process.env.NODE_ENV !== "production" && !process.env.RENDER;
+
+      if (isLocalDev) {
+        console.log(`ℹ️ [DEV FALLBACK] Allowing password reset OTP in dev mode even though Brevo email delivery failed.`);
+        return res.json({
+          success: true,
+          emailSent: false,
+          devOtp: otpCode,
+          message: isBrevoIpBlocked
+            ? `Brevo IP authorization needed (IP blocked). For testing, your OTP code is: ${otpCode} (also check backend terminal).`
+            : `Email delivery issue. For testing, your OTP code is: ${otpCode} (also check backend terminal).`,
+        });
+      }
+
       await db.execute(
         "DELETE FROM password_reset_tokens WHERE token_hash = ?",
         [tokenHash]

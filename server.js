@@ -535,14 +535,16 @@ async function issueAccountOtp(user, purpose, sendEmail) {
     });
   }
 
-  console.log(`[Account OTP] Code issued for ${user.email} (${purpose}) - expires in 10 minutes`);
+  console.log(`\n======================================================`);
+  console.log(`🔑 [ACCOUNT OTP] Code for ${user.email} (${purpose}): [ ${otpCode} ]`);
+  console.log(`======================================================\n`);
 
   try {
     await sendEmail(user.email, otpCode);
-    return { success: true, emailSent: true };
+    return { success: true, emailSent: true, otpCode };
   } catch (emailErr) {
     console.warn(`[Account OTP Email Warning] Could not deliver ${purpose} email to ${user.email}: ${emailErr.message}`);
-    return { success: true, emailSent: false, error: emailErr.message };
+    return { success: true, emailSent: false, error: emailErr.message, otpCode };
   }
 }
 
@@ -681,7 +683,9 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
       });
     }
 
-    console.log(`[Inline Email OTP] Code issued for ${email} (Attempt ${rateLimitCheck.attemptsCount}/3, expires in 10m)`);
+    console.log(`\n======================================================`);
+    console.log(`🔑 [INLINE REGISTRATION OTP] Code for ${email}: [ ${otpCode} ]`);
+    console.log(`======================================================\n`);
 
     let emailSent = false;
     let emailErrorMsg = "";
@@ -696,6 +700,21 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
 
     if (!emailSent) {
       const isBrevoIpBlocked = emailErrorMsg.includes("authorised_ips");
+      const isLocalDev = process.env.NODE_ENV !== "production" && !process.env.RENDER;
+
+      if (isLocalDev) {
+        console.log(`ℹ️ [DEV FALLBACK] Allowing OTP verification in dev mode even though Brevo email delivery failed.`);
+        return res.json({
+          success: true,
+          emailSent: false,
+          devOtp: otpCode,
+          message: isBrevoIpBlocked
+            ? `Brevo IP authorization needed (IP blocked). For testing, your OTP code is: ${otpCode} (also check backend terminal).`
+            : `Email delivery issue. For testing, your OTP code is: ${otpCode} (also check backend terminal).`,
+          attemptsRemaining: rateLimitCheck.attemptsRemaining,
+        });
+      }
+
       return res.status(502).json({
         error: isBrevoIpBlocked
           ? "Brevo IP authorization needed: add your server IP in https://app.brevo.com/security/authorised_ips"
@@ -3042,7 +3061,25 @@ app.post("/api/documents/request-code-otp", requireAuth, accessLimiter, async (r
       docId: doc.id,
     });
 
-    await sendAccessCodeOtpEmail(req.user.email, otpCode, doc.original_name, action || "reveal");
+    console.log(`\n======================================================`);
+    console.log(`🔑 [DOCUMENT 2FA OTP] Code for ${req.user.email} (${action || 'reveal'}): [ ${otpCode} ]`);
+    console.log(`======================================================\n`);
+
+    try {
+      await sendAccessCodeOtpEmail(req.user.email, otpCode, doc.original_name, action || "reveal");
+    } catch (mailErr) {
+      console.warn("[Send Access Code OTP Mail Warning]:", mailErr.message);
+      const isLocalDev = process.env.NODE_ENV !== "production" && !process.env.RENDER;
+      if (isLocalDev) {
+        return res.json({
+          success: true,
+          emailSent: false,
+          devOtp: otpCode,
+          message: `[Dev Mode] Brevo IP blocked. Code: ${otpCode} (also in terminal).`,
+        });
+      }
+      throw mailErr;
+    }
 
     res.json({
       success: true,
