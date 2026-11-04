@@ -36,6 +36,7 @@ const connectLimiter = rateLimit({
 // In-Memory Live Session & WebRTC Signaling Store
 // Sessions are ephemeral; no file data is ever stored here.
 // ---------------------------------------------------------------------------
+const PRESENCE_TIMEOUT_MS = 15000; // 15s presence watchdog (owner offline cutoff)
 const activeSessions = new Map(); // sessionId -> Session
 const codeHashToSessionId = new Map(); // accessCodeHash -> sessionId
 
@@ -134,8 +135,8 @@ setInterval(async () => {
   const now = Date.now();
   for (const [sessionId, session] of activeSessions.entries()) {
     // 1. Heartbeat timeout detection (30 seconds)
-    if (session.status === "active" && now - session.lastHeartbeat > 30000) {
-      console.log(`[Online Share Watchdog] Session #${sessionId} owner timed out (no heartbeat for 30s).`);
+    if (session.status === "active" && now - session.lastHeartbeat > PRESENCE_TIMEOUT_MS) {
+      console.log(`[Online Share Watchdog] Session #${sessionId} owner timed out (no heartbeat for 15s).`);
       session.status = "offline";
       try {
         await db.endOnlineShare(sessionId);
@@ -163,7 +164,7 @@ setInterval(async () => {
   try {
     await db.markExpiredOnlineShares();
   } catch (_) {}
-}, 5000);
+}, 3000);
 
 // ---------------------------------------------------------------------------
 // 1. Public STUN / ICE Configuration
@@ -338,7 +339,7 @@ router.post("/connect", connectLimiter, async (req, res) => {
 
     // Verify presence: session must exist in memory, be 'active', and have heartbeat within last 30s
     const now = Date.now();
-    const isOwnerOnline = Boolean(session && session.status === "active" && now - session.lastHeartbeat <= 30000);
+    const isOwnerOnline = Boolean(session && session.status === "active" && now - session.lastHeartbeat <= PRESENCE_TIMEOUT_MS);
 
     if (!session || !isOwnerOnline) {
       return res.status(410).json({
@@ -393,7 +394,7 @@ router.get("/status/:accessCode", connectLimiter, async (req, res) => {
     const session = sessionId ? activeSessions.get(sessionId) : null;
 
     const now = Date.now();
-    const isOwnerOnline = Boolean(session && session.status === "active" && now - session.lastHeartbeat <= 30000);
+    const isOwnerOnline = Boolean(session && session.status === "active" && now - session.lastHeartbeat <= PRESENCE_TIMEOUT_MS);
 
     if (!session || !isOwnerOnline) {
       return res.status(410).json({
@@ -599,5 +600,23 @@ router.get("/signal/poll", (req, res) => {
 
   return res.json({ success: true, messages });
 });
+
+router.isOwnerOnline = (accessCode) => {
+  if (!accessCode) return false;
+  const codeHash = hashAccessCode(accessCode);
+  const sessionId = codeHashToSessionId.get(codeHash);
+  if (!sessionId) return false;
+  const session = activeSessions.get(sessionId);
+  if (!session || session.status !== "active") return false;
+  return (Date.now() - session.lastHeartbeat) <= PRESENCE_TIMEOUT_MS;
+};
+
+router.getSessionByCode = (accessCode) => {
+  if (!accessCode) return null;
+  const codeHash = hashAccessCode(accessCode);
+  const sessionId = codeHashToSessionId.get(codeHash);
+  if (!sessionId) return null;
+  return activeSessions.get(sessionId) || null;
+};
 
 module.exports = router;

@@ -2552,6 +2552,25 @@ app.post("/api/documents/access", accessLimiter, async (req, res) => {
     const trimmedCode = access_code.trim();
 
     // Try HMAC hash first, then legacy SHA-256 hash
+    // Check if this is a Live Online Share code
+    const isLiveOnline = onlineShareRoutes.isOwnerOnline(trimmedCode);
+    const onlineCodeHash = crypto.createHash("sha256").update(String(trimmedCode).toUpperCase()).digest("hex");
+    const dbOnlineShare = await db.findOnlineShareByCodeHash(onlineCodeHash);
+
+    if (isLiveOnline) {
+      return res.json({
+        isOnlineLiveShare: true,
+        access_code: trimmedCode,
+        message: "Live P2P session active! The owner is currently online.",
+      });
+    }
+
+    if (dbOnlineShare) {
+      return res.status(410).json({
+        error: "This shared file is no longer available. The owner has ended the sharing session.",
+      });
+    }
+
     let doc = await findDocumentByHash(hashCode(trimmedCode));
     if (!doc) {
       doc = await findDocumentByHash(legacyHashCode(trimmedCode));
