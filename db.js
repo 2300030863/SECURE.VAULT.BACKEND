@@ -1755,6 +1755,7 @@ module.exports = {
   getDbStatus,
   createOnlineShare,
   findOnlineShareByHash,
+  findOnlineShareByCodeHash: findOnlineShareByHash,
   findOnlineShareById,
   updateOnlineShareHeartbeat,
   endOnlineShare,

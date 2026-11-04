@@ -2553,21 +2553,41 @@ app.post("/api/documents/access", accessLimiter, async (req, res) => {
 
     // Try HMAC hash first, then legacy SHA-256 hash
     // Check if this is a Live Online Share code
-    const isLiveOnline = onlineShareRoutes.isOwnerOnline(trimmedCode);
-    const onlineCodeHash = crypto.createHash("sha256").update(String(trimmedCode).toUpperCase()).digest("hex");
-    const dbOnlineShare = await db.findOnlineShareByCodeHash(onlineCodeHash);
+    const cleanUpperCode = String(trimmedCode).toUpperCase();
+    const isLiveOnline = onlineShareRoutes && typeof onlineShareRoutes.isOwnerOnline === "function"
+      ? onlineShareRoutes.isOwnerOnline(cleanUpperCode)
+      : false;
+    const onlineCodeHash = crypto.createHash("sha256").update(cleanUpperCode).digest("hex");
+    let dbOnlineShare = null;
+    try {
+      if (typeof db.findOnlineShareByHash === "function") {
+        dbOnlineShare = await db.findOnlineShareByHash(onlineCodeHash);
+      } else if (typeof db.findOnlineShareByCodeHash === "function") {
+        dbOnlineShare = await db.findOnlineShareByCodeHash(onlineCodeHash);
+      }
+    } catch (e) {
+      console.warn("[Access Check DB Online Share Warning]", e.message);
+    }
 
     if (isLiveOnline) {
       return res.json({
         isOnlineLiveShare: true,
-        access_code: trimmedCode,
+        access_code: cleanUpperCode,
         message: "Live P2P session active! The owner is currently online.",
       });
     }
 
     if (dbOnlineShare) {
+      const shareStatus = dbOnlineShare.session_status || dbOnlineShare.status;
+      if (shareStatus === "active") {
+        return res.json({
+          isOnlineLiveShare: true,
+          access_code: cleanUpperCode,
+          message: "Live P2P session active!",
+        });
+      }
       return res.status(410).json({
-        error: "This shared file is no longer available. The owner has ended the sharing session.",
+        error: "This shared file is no longer available. The owner has ended the sharing session or turned offline.",
       });
     }
 
