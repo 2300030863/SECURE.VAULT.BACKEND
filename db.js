@@ -12,6 +12,7 @@ const LOCAL_DB_FILE = path.join(__dirname, "local_documents.json");
 const LOCAL_USERS_FILE = path.join(__dirname, "local_users.json");
 const LOCAL_AUDIT_FILE = path.join(__dirname, "local_audit_logs.json");
 const LOCAL_OTP_LIMITS_FILE = path.join(__dirname, "local_otp_rate_limits.json");
+const LOCAL_ONLINE_SHARES_FILE = path.join(__dirname, "local_online_shares.json");
 
 // ---------------------------------------------------------------------------
 // Local JSON Fallback Helpers (Development Only)
@@ -93,6 +94,26 @@ function saveLocalOtpLimits(data) {
     fs.writeFileSync(LOCAL_OTP_LIMITS_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch (err) {
     console.error("[Local DB Fallback] Error writing OTP rate limits file:", err.message);
+  }
+}
+
+function loadLocalOnlineShares() {
+  try {
+    if (fs.existsSync(LOCAL_ONLINE_SHARES_FILE)) {
+      const data = fs.readFileSync(LOCAL_ONLINE_SHARES_FILE, "utf8");
+      return JSON.parse(data);
+    }
+  } catch (err) {
+    console.error("[Local DB Fallback] Error reading online shares file:", err.message);
+  }
+  return [];
+}
+
+function saveLocalOnlineShares(shares) {
+  try {
+    fs.writeFileSync(LOCAL_ONLINE_SHARES_FILE, JSON.stringify(shares, null, 2), "utf8");
+  } catch (err) {
+    console.error("[Local DB Fallback] Error writing online shares file:", err.message);
   }
 }
 
@@ -317,6 +338,37 @@ async function initDatabase() {
           INDEX idx_rate_key (rate_key)
         );
       `);
+
+      // 5. Online Temporary Sharing Sessions Table
+      // Plain-text access codes and actual file contents are NEVER stored here;
+      // only metadata and access_code_hash are used for presence & verification.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS online_shares (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          owner_id BIGINT NOT NULL,
+          access_code_hash CHAR(64) NOT NULL UNIQUE,
+          file_name VARCHAR(255) NOT NULL,
+          file_size BIGINT NOT NULL,
+          mime_type VARCHAR(120) DEFAULT 'application/octet-stream',
+          session_status VARCHAR(20) NOT NULL DEFAULT 'active',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_heartbeat TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          expires_at DATETIME NOT NULL,
+          ended_at DATETIME NULL,
+          INDEX idx_online_code_hash (access_code_hash),
+          INDEX idx_online_owner (owner_id, session_status),
+          INDEX idx_online_heartbeat (last_heartbeat),
+          INDEX idx_online_status (session_status)
+        );
+      `);
+
+      await safeAddColumn(pool, "online_shares", "session_status", "VARCHAR(20) NOT NULL DEFAULT 'active'");
+      await safeAddColumn(pool, "online_shares", "last_heartbeat", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
+      await safeAddColumn(pool, "online_shares", "expires_at", "DATETIME NOT NULL");
+      await safeAddColumn(pool, "online_shares", "ended_at", "DATETIME NULL");
+      await safeAddIndex(pool, "online_shares", "idx_online_code_hash", "(access_code_hash)");
+      await safeAddIndex(pool, "online_shares", "idx_online_owner", "(owner_id, session_status)");
+      await safeAddIndex(pool, "online_shares", "idx_online_heartbeat", "(last_heartbeat)");
 
       isTiDBConnected = true;
       dbMode = "tidb_cloud";
@@ -1488,6 +1540,175 @@ async function removeOtpRateLimitRecord(key) {
   saveLocalOtpLimits(store);
 }
 
+// ---------------------------------------------------------------------------
+// Online Temporary Sharing Sessions Operations
+// Zero file content is stored; only metadata, presence timestamps, and hashed codes.
+// ---------------------------------------------------------------------------
+
+async function createOnlineShare({
+  owner_id,
+  access_code_hash,
+  file_name,
+  file_size,
+  mime_type = "application/octet-stream",
+  expires_at,
+}) {
+  const normMime = mime_type || "application/octet-stream";
+  const now = new Date();
+  const expDate = expires_at instanceof Date ? expires_at : new Date(expires_at);
+
+  if (isTiDBConnected && pool) {
+    const [result] = await pool.query(
+      `INSERT INTO online_shares
+        (owner_id, access_code_hash, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at)
+       VALUES (?, ?, ?, ?, ?, 'active', NOW(), NOW(), ?)`,
+      [owner_id, access_code_hash, file_name, file_size, normMime, expDate]
+    );
+    return {
+      id: result.insertId,
+      owner_id,
+      file_name,
+      file_size,
+      mime_type: normMime,
+      session_status: "active",
+      created_at: now.toISOString(),
+      last_heartbeat: now.toISOString(),
+      expires_at: expDate.toISOString(),
+    };
+  }
+
+  const shares = loadLocalOnlineShares();
+  const newShare = {
+    id: Date.now(),
+    owner_id,
+    access_code_hash,
+    file_name,
+    file_size,
+    mime_type: normMime,
+    session_status: "active",
+    created_at: now.toISOString(),
+    last_heartbeat: now.toISOString(),
+    expires_at: expDate.toISOString(),
+    ended_at: null,
+  };
+  shares.push(newShare);
+  saveLocalOnlineShares(shares);
+  return newShare;
+}
+
+async function findOnlineShareByHash(codeHash) {
+  if (isTiDBConnected && pool) {
+    const [rows] = await pool.query(
+      `SELECT id, owner_id, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at, ended_at
+       FROM online_shares
+       WHERE access_code_hash = ?
+       ORDER BY id DESC LIMIT 1`,
+      [codeHash]
+    );
+    return rows[0] || null;
+  }
+  const shares = loadLocalOnlineShares();
+  return shares.find((s) => s.access_code_hash === codeHash) || null;
+}
+
+async function findOnlineShareById(id) {
+  if (isTiDBConnected && pool) {
+    const [rows] = await pool.query(
+      `SELECT id, owner_id, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at, ended_at
+       FROM online_shares
+       WHERE id = ? LIMIT 1`,
+      [id]
+    );
+    return rows[0] || null;
+  }
+  const shares = loadLocalOnlineShares();
+  return shares.find((s) => Number(s.id) === Number(id)) || null;
+}
+
+async function updateOnlineShareHeartbeat(id) {
+  if (isTiDBConnected && pool) {
+    await pool.query(
+      `UPDATE online_shares
+       SET last_heartbeat = NOW()
+       WHERE id = ? AND session_status = 'active'`,
+      [id]
+    );
+    return;
+  }
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(id));
+  if (share && share.session_status === "active") {
+    share.last_heartbeat = new Date().toISOString();
+    saveLocalOnlineShares(shares);
+  }
+}
+
+async function endOnlineShare(id, ownerId = null) {
+  if (isTiDBConnected && pool) {
+    const queryStr = ownerId
+      ? `UPDATE online_shares SET session_status = 'ended', ended_at = NOW() WHERE id = ? AND owner_id = ?`
+      : `UPDATE online_shares SET session_status = 'ended', ended_at = NOW() WHERE id = ?`;
+    const params = ownerId ? [id, ownerId] : [id];
+    await pool.query(queryStr, params);
+    return;
+  }
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(id) && (!ownerId || Number(s.owner_id) === Number(ownerId)));
+  if (share) {
+    share.session_status = "ended";
+    share.ended_at = new Date().toISOString();
+    saveLocalOnlineShares(shares);
+  }
+}
+
+async function markExpiredOnlineShares() {
+  if (isTiDBConnected && pool) {
+    const [result] = await pool.query(
+      `UPDATE online_shares
+       SET session_status = 'offline', ended_at = NOW()
+       WHERE session_status = 'active'
+         AND (last_heartbeat < (NOW() - INTERVAL 30 SECOND) OR expires_at < NOW())`
+    );
+    return result.affectedRows || 0;
+  }
+  const shares = loadLocalOnlineShares();
+  const now = Date.now();
+  let count = 0;
+  shares.forEach((s) => {
+    if (s.session_status === "active") {
+      const hbTime = new Date(s.last_heartbeat).getTime();
+      const expTime = new Date(s.expires_at).getTime();
+      if (now - hbTime > 30000 || now >= expTime) {
+        s.session_status = "offline";
+        s.ended_at = new Date().toISOString();
+        count++;
+      }
+    }
+  });
+  if (count > 0) saveLocalOnlineShares(shares);
+  return count;
+}
+
+async function listActiveOnlineSharesByOwner(ownerId) {
+  if (isTiDBConnected && pool) {
+    const [rows] = await pool.query(
+      `SELECT id, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at
+       FROM online_shares
+       WHERE owner_id = ? AND session_status = 'active' AND last_heartbeat >= (NOW() - INTERVAL 30 SECOND)
+       ORDER BY id DESC`,
+      [ownerId]
+    );
+    return rows;
+  }
+  const shares = loadLocalOnlineShares();
+  const now = Date.now();
+  return shares.filter((s) => {
+    if (Number(s.owner_id) !== Number(ownerId) || s.session_status !== "active") return false;
+    const hbTime = new Date(s.last_heartbeat).getTime();
+    return now - hbTime <= 30000;
+  });
+}
+
 module.exports = {
   initDatabase,
   getPool,
@@ -1531,4 +1752,11 @@ module.exports = {
   releaseDownloadReservation,
   finalizeDownload,
   getDbStatus,
+  createOnlineShare,
+  findOnlineShareByHash,
+  findOnlineShareById,
+  updateOnlineShareHeartbeat,
+  endOnlineShare,
+  markExpiredOnlineShares,
+  listActiveOnlineSharesByOwner,
 };

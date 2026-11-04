@@ -63,6 +63,7 @@ const {
 const db = require("./db");
 const authRoutes = require("./authRoutes");
 const adminRoutes = require("./adminRoutes");
+const onlineShareRoutes = require("./onlineShareRoutes");
 const { checkOtpRateLimit, resetOtpRateLimit, getOtpRateLimitStatus } = require("./otpRateLimiter");
 const {
   extractDocumentText,
@@ -496,6 +497,7 @@ app.get("/api/announcement", (_req, res) => {
 // Mount Forgot Password & Reset Password Router
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes.router);
+app.use("/api/online-share", optionalAuth, onlineShareRoutes);
 
 function createOtpCode() {
   return crypto.randomInt(100000, 1000000).toString();
