@@ -351,6 +351,10 @@ async function initDatabase() {
           file_size BIGINT NOT NULL,
           mime_type VARCHAR(120) DEFAULT 'application/octet-stream',
           session_status VARCHAR(20) NOT NULL DEFAULT 'active',
+          view_count INT NOT NULL DEFAULT 0,
+          download_count INT NOT NULL DEFAULT 0,
+          max_downloads VARCHAR(20) DEFAULT 'unlimited',
+          delete_after_download BOOLEAN DEFAULT FALSE,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           last_heartbeat TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           expires_at DATETIME NOT NULL,
@@ -364,6 +368,10 @@ async function initDatabase() {
 
       try { await pool.query("ALTER TABLE online_shares MODIFY owner_id BIGINT NULL"); } catch (_) {}
       await safeAddColumn(pool, "online_shares", "session_status", "VARCHAR(20) NOT NULL DEFAULT 'active'");
+      await safeAddColumn(pool, "online_shares", "view_count", "INT NOT NULL DEFAULT 0");
+      await safeAddColumn(pool, "online_shares", "download_count", "INT NOT NULL DEFAULT 0");
+      await safeAddColumn(pool, "online_shares", "max_downloads", "VARCHAR(20) DEFAULT 'unlimited'");
+      await safeAddColumn(pool, "online_shares", "delete_after_download", "BOOLEAN DEFAULT FALSE");
       await safeAddColumn(pool, "online_shares", "last_heartbeat", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
       await safeAddColumn(pool, "online_shares", "expires_at", "DATETIME NOT NULL");
       await safeAddColumn(pool, "online_shares", "ended_at", "DATETIME NULL");
@@ -1553,17 +1561,21 @@ async function createOnlineShare({
   file_size,
   mime_type = "application/octet-stream",
   expires_at,
+  max_downloads = "unlimited",
+  delete_after_download = false,
 }) {
   const normMime = mime_type || "application/octet-stream";
   const now = new Date();
   const expDate = expires_at instanceof Date ? expires_at : new Date(expires_at);
+  const maxDlVal = max_downloads === "unlimited" || max_downloads == null ? "unlimited" : String(max_downloads);
+  const delAfterVal = Boolean(delete_after_download);
 
   if (isTiDBConnected && pool) {
     const [result] = await pool.query(
       `INSERT INTO online_shares
-        (owner_id, access_code_hash, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at)
-       VALUES (?, ?, ?, ?, ?, 'active', NOW(), NOW(), ?)`,
-      [owner_id || null, access_code_hash, file_name, file_size, normMime, expDate]
+        (owner_id, access_code_hash, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at)
+       VALUES (?, ?, ?, ?, ?, 'active', 0, 0, ?, ?, NOW(), NOW(), ?)`,
+      [owner_id || null, access_code_hash, file_name, file_size, normMime, maxDlVal, delAfterVal, expDate]
     );
     return {
       id: result.insertId,
@@ -1572,6 +1584,10 @@ async function createOnlineShare({
       file_size,
       mime_type: normMime,
       session_status: "active",
+      view_count: 0,
+      download_count: 0,
+      max_downloads: maxDlVal,
+      delete_after_download: delAfterVal,
       created_at: now.toISOString(),
       last_heartbeat: now.toISOString(),
       expires_at: expDate.toISOString(),
@@ -1587,6 +1603,10 @@ async function createOnlineShare({
     file_size,
     mime_type: normMime,
     session_status: "active",
+    view_count: 0,
+    download_count: 0,
+    max_downloads: maxDlVal,
+    delete_after_download: delAfterVal,
     created_at: now.toISOString(),
     last_heartbeat: now.toISOString(),
     expires_at: expDate.toISOString(),
@@ -1600,7 +1620,7 @@ async function createOnlineShare({
 async function findOnlineShareByHash(codeHash) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, owner_id, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at, ended_at
+      `SELECT id, owner_id, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at, ended_at
        FROM online_shares
        WHERE access_code_hash = ?
        ORDER BY id DESC LIMIT 1`,
@@ -1615,7 +1635,7 @@ async function findOnlineShareByHash(codeHash) {
 async function findOnlineShareById(id) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, owner_id, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at, ended_at
+      `SELECT id, owner_id, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at, ended_at
        FROM online_shares
        WHERE id = ? LIMIT 1`,
       [id]
@@ -1624,6 +1644,44 @@ async function findOnlineShareById(id) {
   }
   const shares = loadLocalOnlineShares();
   return shares.find((s) => Number(s.id) === Number(id)) || null;
+}
+
+async function incrementOnlineShareViewCount(id) {
+  if (!id) return;
+  if (isTiDBConnected && pool) {
+    try {
+      await pool.query(
+        `UPDATE online_shares SET view_count = COALESCE(view_count, 0) + 1 WHERE id = ?`,
+        [id]
+      );
+    } catch (_) {}
+    return;
+  }
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(id));
+  if (share) {
+    share.view_count = (share.view_count || 0) + 1;
+    saveLocalOnlineShares(shares);
+  }
+}
+
+async function incrementOnlineShareDownloadCount(id) {
+  if (!id) return;
+  if (isTiDBConnected && pool) {
+    try {
+      await pool.query(
+        `UPDATE online_shares SET download_count = COALESCE(download_count, 0) + 1 WHERE id = ?`,
+        [id]
+      );
+    } catch (_) {}
+    return;
+  }
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(id));
+  if (share) {
+    share.download_count = (share.download_count || 0) + 1;
+    saveLocalOnlineShares(shares);
+  }
 }
 
 async function updateOnlineShareHeartbeat(id) {
@@ -1693,7 +1751,7 @@ async function markExpiredOnlineShares() {
 async function listActiveOnlineSharesByOwner(ownerId) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at
+      `SELECT id, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at
        FROM online_shares
        WHERE owner_id = ? AND session_status = 'active' AND last_heartbeat >= (NOW() - INTERVAL 30 SECOND)
        ORDER BY id DESC`,
@@ -1761,4 +1819,6 @@ module.exports = {
   endOnlineShare,
   markExpiredOnlineShares,
   listActiveOnlineSharesByOwner,
+  incrementOnlineShareViewCount,
+  incrementOnlineShareDownloadCount,
 };

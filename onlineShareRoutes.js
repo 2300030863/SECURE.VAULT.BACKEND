@@ -235,6 +235,8 @@ router.post("/create", async (req, res) => {
       file_size: parsedSize,
       mime_type: cleanMime,
       expires_at: expiresAt,
+      max_downloads: maxDownloads,
+      delete_after_download: Boolean(deleteAfterDownload),
     });
 
     const sessionId = Number(dbRecord.id);
@@ -248,6 +250,10 @@ router.post("/create", async (req, res) => {
       fileName: cleanFileName,
       fileSize: parsedSize,
       mimeType: cleanMime,
+      maxDownloads: maxDownloads || "unlimited",
+      deleteAfterDownload: Boolean(deleteAfterDownload),
+      viewCount: 0,
+      downloadCount: 0,
       status: "active",
       createdAt: Date.now(),
       lastHeartbeat: Date.now(),
@@ -275,6 +281,9 @@ router.post("/create", async (req, res) => {
       fileName: cleanFileName,
       fileSize: parsedSize,
       mimeType: cleanMime,
+      viewCount: 0,
+      downloadCount: 0,
+      maxDownloads: session.maxDownloads,
       expiresAt: expiresAt.toISOString(),
       message: "Live sharing session created. Keep this tab open while sharing.",
     });
@@ -312,6 +321,9 @@ router.post("/heartbeat", async (req, res) => {
     return res.json({
       success: true,
       status: "active",
+      viewCount: session.viewCount || 0,
+      downloadCount: session.downloadCount || 0,
+      maxDownloads: session.maxDownloads || "unlimited",
       recipientConnected: Boolean(session.recipientToken),
     });
   } catch (err) {
@@ -349,6 +361,18 @@ router.post("/connect", connectLimiter, async (req, res) => {
       });
     }
 
+    // Increment View Count
+    session.viewCount = (session.viewCount || 0) + 1;
+    try {
+      await db.incrementOnlineShareViewCount(session.id);
+    } catch (_) {}
+
+    deliverSignal(session, "owner", "stats-updated", {
+      viewCount: session.viewCount,
+      downloadCount: session.downloadCount || 0,
+      maxDownloads: session.maxDownloads || "unlimited",
+    });
+
     // Reuse recent recipient token or generate a unique token
     if (!session.recipientToken || !session.lastRecipientConnect || (now - session.lastRecipientConnect > 30000)) {
       session.recipientToken = crypto.randomBytes(24).toString("hex");
@@ -364,7 +388,7 @@ router.post("/connect", connectLimiter, async (req, res) => {
       });
     }
 
-    console.log(`[Online Share Connect] Recipient connected to session #${session.id}`);
+    console.log(`[Online Share Connect] Recipient connected to session #${session.id} (Total views: ${session.viewCount})`);
 
     return res.json({
       success: true,
@@ -375,6 +399,9 @@ router.post("/connect", connectLimiter, async (req, res) => {
         fileSize: session.fileSize,
         mimeType: session.mimeType,
       },
+      viewCount: session.viewCount,
+      downloadCount: session.downloadCount || 0,
+      maxDownloads: session.maxDownloads || "unlimited",
       ownerOnline: true,
     });
   } catch (err) {
@@ -409,15 +436,92 @@ router.get("/status/:accessCode", connectLimiter, async (req, res) => {
       });
     }
 
+    // Increment View Count
+    session.viewCount = (session.viewCount || 0) + 1;
+    try {
+      await db.incrementOnlineShareViewCount(session.id);
+    } catch (_) {}
+
+    deliverSignal(session, "owner", "stats-updated", {
+      viewCount: session.viewCount,
+      downloadCount: session.downloadCount || 0,
+      maxDownloads: session.maxDownloads || "unlimited",
+    });
+
     return res.json({
       exists: true,
       ownerOnline: true,
       fileName: session.fileName,
       fileSize: session.fileSize,
       mimeType: session.mimeType,
+      viewCount: session.viewCount,
+      downloadCount: session.downloadCount || 0,
+      maxDownloads: session.maxDownloads || "unlimited",
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: "Unable to inspect session status." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 5B. Recipient Download Complete Notification
+// ---------------------------------------------------------------------------
+router.post("/download-complete", async (req, res) => {
+  try {
+    const { sessionId, recipientToken } = req.body;
+    const sId = Number(sessionId);
+    const session = activeSessions.get(sId);
+
+    if (!session || session.status !== "active") {
+      return res.status(404).json({ success: false, error: "Sharing session is no longer active." });
+    }
+
+    if (session.recipientToken && recipientToken && session.recipientToken !== recipientToken) {
+      return res.status(403).json({ success: false, error: "Invalid recipient token." });
+    }
+
+    session.downloadCount = (session.downloadCount || 0) + 1;
+    try {
+      await db.incrementOnlineShareDownloadCount(sId);
+    } catch (e) {
+      console.warn("[Online Share DB Download Increment Warning]", e.message);
+    }
+
+    console.log(`[Online Share Download] Session #${sId} completed download #${session.downloadCount}`);
+
+    // Deliver live update to owner
+    deliverSignal(session, "owner", "stats-updated", {
+      viewCount: session.viewCount || 0,
+      downloadCount: session.downloadCount,
+      maxDownloads: session.maxDownloads || "unlimited",
+    });
+
+    // Check Auto-End on 1st download (Burn on Finish) or Max Downloads reached
+    const isBurnOnFinish = Boolean(session.deleteAfterDownload);
+    const isMaxReached =
+      session.maxDownloads &&
+      session.maxDownloads !== "unlimited" &&
+      session.downloadCount >= Number(session.maxDownloads);
+
+    if (isBurnOnFinish || isMaxReached) {
+      console.log(`[Online Share Auto-End] Session #${sId} limit reached. Ending session.`);
+      setTimeout(async () => {
+        terminateSessionResources(session, "limit-reached");
+        try {
+          await db.endOnlineShare(sId);
+        } catch (_) {}
+      }, 3500);
+    }
+
+    return res.json({
+      success: true,
+      downloadCount: session.downloadCount,
+      viewCount: session.viewCount || 0,
+      isEnded: isBurnOnFinish || isMaxReached,
+    });
+  } catch (err) {
+    console.error("[Online Share Download Complete Error]", err);
+    return res.status(500).json({ success: false, error: "Failed to record download completion." });
   }
 });
 

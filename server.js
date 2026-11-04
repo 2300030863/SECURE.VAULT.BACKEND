@@ -2570,6 +2570,17 @@ app.post("/api/documents/access", accessLimiter, async (req, res) => {
     }
 
     if (isLiveOnline) {
+      const activeSession = onlineShareRoutes && typeof onlineShareRoutes.getSessionByCode === "function"
+        ? onlineShareRoutes.getSessionByCode(cleanUpperCode)
+        : null;
+      if (activeSession) {
+        activeSession.viewCount = (activeSession.viewCount || 0) + 1;
+        try {
+          if (typeof db.incrementOnlineShareViewCount === "function") {
+            await db.incrementOnlineShareViewCount(activeSession.id);
+          }
+        } catch (_) {}
+      }
       return res.json({
         isOnlineLiveShare: true,
         access_code: cleanUpperCode,
@@ -3204,6 +3215,31 @@ app.get("/api/documents/mine", requireAuth, async (req, res) => {
     await purgeExpiredDocuments();
     const docs = await listUserDocuments(req.user.id, 50);
 
+    let onlineShares = [];
+    try {
+      if (typeof db.listActiveOnlineSharesByOwner === "function") {
+        const rawShares = await db.listActiveOnlineSharesByOwner(req.user.id);
+        onlineShares = rawShares.map((s) => ({
+          id: `online_${s.id}`,
+          online_share_id: s.id,
+          original_name: s.file_name,
+          file_size: s.file_size,
+          mime_type: s.mime_type,
+          storage_mode: "online",
+          session_status: s.session_status,
+          view_count: s.view_count || 0,
+          download_count: s.download_count || 0,
+          max_downloads: s.max_downloads === "unlimited" || !s.max_downloads ? null : Number(s.max_downloads),
+          delete_after_download: Boolean(s.delete_after_download),
+          created_at: s.created_at,
+          expires_at: s.expires_at,
+          is_online_live: true,
+        }));
+      }
+    } catch (e) {
+      console.warn("[List Mine Online Shares Warning]", e.message);
+    }
+
     // Provide short-lived (15m), single-document scoped tickets (mitigates session token exposure in URLs)
     const enrichedDocs = docs.map((doc) => {
       const codeParam = doc.access_code ? encodeURIComponent(doc.access_code) : "";
@@ -3223,7 +3259,7 @@ app.get("/api/documents/mine", requireAuth, async (req, res) => {
     });
     res.json({
       success: true,
-      documents: enrichedDocs
+      documents: [...onlineShares, ...enrichedDocs]
     });
   } catch (err) {
     console.error("List mine error:", err);
