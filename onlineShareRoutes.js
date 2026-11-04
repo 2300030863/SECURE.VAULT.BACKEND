@@ -187,14 +187,8 @@ router.get("/ice-servers", (_req, res) => {
 // ---------------------------------------------------------------------------
 router.post("/create", async (req, res) => {
   try {
-    // 1. Authentication check
-    if (!req.user || !req.user.id) {
-      return res.status(401).json({
-        success: false,
-        error: "You must be signed in to create an Online Share session.",
-        requireAuth: true,
-      });
-    }
+    // 1. Identify user (supports authenticated accounts and guest live sharing)
+    const ownerId = req.user && req.user.id ? Number(req.user.id) : null;
 
     const { fileName, fileSize, mimeType, durationMinutes = 60 } = req.body;
 
@@ -234,7 +228,7 @@ router.post("/create", async (req, res) => {
 
     // 4. Save metadata in TiDB Cloud / Database (NEVER storing file contents)
     const dbRecord = await db.createOnlineShare({
-      owner_id: req.user.id,
+      owner_id: ownerId,
       access_code_hash: accessCodeHash,
       file_name: cleanFileName,
       file_size: parsedSize,
@@ -247,7 +241,7 @@ router.post("/create", async (req, res) => {
     // 5. Initialize In-Memory Session
     const session = {
       id: sessionId,
-      ownerId: Number(req.user.id),
+      ownerId: ownerId,
       accessCode,
       accessCodeHash,
       fileName: cleanFileName,
@@ -268,7 +262,7 @@ router.post("/create", async (req, res) => {
     activeSessions.set(sessionId, session);
     codeHashToSessionId.set(accessCodeHash, sessionId);
 
-    console.log(`[Online Share Created] Session #${sessionId} by user #${req.user.id} (${cleanFileName}, ${parsedSize} bytes)`);
+    console.log(`[Online Share Created] Session #${sessionId} by user #${ownerId || "guest"} (${cleanFileName}, ${parsedSize} bytes)`);
 
     // Return the generated access code to the owner
     // Note: The database hash is NEVER exposed to the client

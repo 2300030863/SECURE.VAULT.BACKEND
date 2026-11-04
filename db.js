@@ -345,7 +345,7 @@ async function initDatabase() {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS online_shares (
           id BIGINT AUTO_INCREMENT PRIMARY KEY,
-          owner_id BIGINT NOT NULL,
+          owner_id BIGINT NULL,
           access_code_hash CHAR(64) NOT NULL UNIQUE,
           file_name VARCHAR(255) NOT NULL,
           file_size BIGINT NOT NULL,
@@ -362,6 +362,7 @@ async function initDatabase() {
         );
       `);
 
+      try { await pool.query("ALTER TABLE online_shares MODIFY owner_id BIGINT NULL"); } catch (_) {}
       await safeAddColumn(pool, "online_shares", "session_status", "VARCHAR(20) NOT NULL DEFAULT 'active'");
       await safeAddColumn(pool, "online_shares", "last_heartbeat", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
       await safeAddColumn(pool, "online_shares", "expires_at", "DATETIME NOT NULL");
@@ -1562,7 +1563,7 @@ async function createOnlineShare({
       `INSERT INTO online_shares
         (owner_id, access_code_hash, file_name, file_size, mime_type, session_status, created_at, last_heartbeat, expires_at)
        VALUES (?, ?, ?, ?, ?, 'active', NOW(), NOW(), ?)`,
-      [owner_id, access_code_hash, file_name, file_size, normMime, expDate]
+      [owner_id || null, access_code_hash, file_name, file_size, normMime, expDate]
     );
     return {
       id: result.insertId,
@@ -1580,7 +1581,7 @@ async function createOnlineShare({
   const shares = loadLocalOnlineShares();
   const newShare = {
     id: Date.now(),
-    owner_id,
+    owner_id: owner_id || null,
     access_code_hash,
     file_name,
     file_size,

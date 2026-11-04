@@ -296,7 +296,11 @@ const loginLimiter = rateLimit({
 const extractToken = (req) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
-    return authHeader.substring(7).trim();
+    const raw = authHeader.substring(7).trim();
+    if (!raw || raw === "null" || raw === "undefined") {
+      return null;
+    }
+    return raw;
   }
   return null;
 };
