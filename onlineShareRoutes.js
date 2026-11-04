@@ -349,15 +349,20 @@ router.post("/connect", connectLimiter, async (req, res) => {
       });
     }
 
-    // Generate unique token for this recipient
-    const recipientToken = crypto.randomBytes(24).toString("hex");
-    session.recipientToken = recipientToken;
+    // Reuse recent recipient token or generate a unique token
+    if (!session.recipientToken || !session.lastRecipientConnect || (now - session.lastRecipientConnect > 30000)) {
+      session.recipientToken = crypto.randomBytes(24).toString("hex");
+    }
+    const recipientToken = session.recipientToken;
 
-    // Notify the owner that a recipient is connecting
-    deliverSignal(session, "owner", "recipient-connected", {
-      recipientToken,
-      timestamp: Date.now(),
-    });
+    // Throttle recipient-connected notifications to owner (prevents rapid duplicate offers)
+    if (!session.lastRecipientConnect || (now - session.lastRecipientConnect > 2000)) {
+      session.lastRecipientConnect = now;
+      deliverSignal(session, "owner", "recipient-connected", {
+        recipientToken,
+        timestamp: now,
+      });
+    }
 
     console.log(`[Online Share Connect] Recipient connected to session #${session.id}`);
 
