@@ -1,5 +1,3 @@
-const nodemailer = require("nodemailer");
-
 function isBrevoConfigured() {
   const apiKey = process.env.BREVO_API_KEY?.trim();
   const senderEmail = process.env.BREVO_SENDER_EMAIL?.trim();
@@ -18,19 +16,6 @@ function isResendConfigured() {
     apiKey !== "YOUR_RESEND_API_KEY" &&
     apiKey.startsWith("re_")
   );
-}
-
-function isSmtpConfigured() {
-  const gmailUser = process.env.GMAIL_USER?.trim();
-  const gmailPass = process.env.GMAIL_APP_PASSWORD?.trim();
-  if (gmailUser && gmailPass && gmailUser !== "your-email@gmail.com") return true;
-
-  const smtpHost = process.env.SMTP_HOST?.trim();
-  const smtpUser = process.env.SMTP_USER?.trim();
-  const smtpPass = process.env.SMTP_PASS?.trim();
-  if (smtpHost && smtpUser && smtpPass) return true;
-
-  return false;
 }
 
 function getBrevoSender() {
@@ -73,17 +58,17 @@ async function sendBrevoEmail({ to, subject, html, text, otpCode }) {
   if (!response.ok) {
     console.error("[Brevo API Error]", data);
     const msg = data.message || `Brevo returned status ${response.status}`;
-    const deliveryError = new Error(msg);
-    deliveryError.code = "BREVO_DELIVERY_ERROR";
-    deliveryError.details = data;
-    throw deliveryError;
+    const brevoErr = new Error(msg);
+    brevoErr.code = "BREVO_DELIVERY_ERROR";
+    brevoErr.details = data;
+    throw brevoErr;
   }
 
   return { messageId: data.messageId || "sent", provider: "brevo", otpCode };
 }
 
 async function sendResendEmail({ to, subject, html, text, otpCode }) {
-  const apiKey = process.env.RESEND_API_KEY.trim();
+  const apiKey = process.env.RESEND_API_KEY?.trim();
   const from = process.env.RESEND_FROM?.trim() || "DocQevrilo <onboarding@resend.dev>";
 
   const response = await fetch("https://api.resend.com/emails", {
@@ -105,59 +90,19 @@ async function sendResendEmail({ to, subject, html, text, otpCode }) {
 
   if (!response.ok) {
     console.error("[Resend API Error]", data);
-    const err = new Error(data.message || `Resend returned status ${response.status}`);
-    err.code = "RESEND_DELIVERY_ERROR";
-    err.details = data;
-    throw err;
+    const resendErr = new Error(data.message || `Resend returned status ${response.status}`);
+    resendErr.code = "RESEND_DELIVERY_ERROR";
+    resendErr.details = data;
+    throw resendErr;
   }
 
   return { messageId: data.id || "sent", provider: "resend", otpCode };
 }
 
-async function sendSmtpEmail({ to, subject, html, text, otpCode }) {
-  let transporter;
-  let from;
-
-  const gmailUser = process.env.GMAIL_USER?.trim();
-  const gmailPass = process.env.GMAIL_APP_PASSWORD?.trim();
-
-  if (gmailUser && gmailPass) {
-    transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: {
-        user: gmailUser,
-        pass: gmailPass.replace(/\s+/g, ""),
-      },
-    });
-    from = `"DocQevrilo" <${gmailUser}>`;
-  } else {
-    transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST.trim(),
-      port: Number(process.env.SMTP_PORT) || 587,
-      secure: Number(process.env.SMTP_PORT) === 465,
-      auth: {
-        user: process.env.SMTP_USER.trim(),
-        pass: process.env.SMTP_PASS.trim(),
-      },
-    });
-    from = process.env.SMTP_FROM || `"DocQevrilo" <${process.env.SMTP_USER.trim()}>`;
-  }
-
-  const info = await transporter.sendMail({
-    from,
-    to,
-    subject,
-    html,
-    text,
-  });
-
-  return { messageId: info.messageId, provider: "smtp", otpCode };
-}
-
 async function sendEmail(message) {
   const errors = [];
 
-  // Priority 1: Resend (no IP restrictions, works everywhere)
+  // Priority 1: Resend (no IP restrictions, works on cloud hosts)
   if (isResendConfigured()) {
     try {
       return await sendResendEmail(message);
@@ -167,17 +112,7 @@ async function sendEmail(message) {
     }
   }
 
-  // Priority 2: Gmail / SMTP (no IP restrictions, works everywhere)
-  if (isSmtpConfigured()) {
-    try {
-      return await sendSmtpEmail(message);
-    } catch (e) {
-      console.warn("[Email Provider Fail] SMTP/Gmail failed, trying fallback:", e.message);
-      errors.push(`SMTP: ${e.message}`);
-    }
-  }
-
-  // Priority 3: Brevo REST API
+  // Priority 2: Brevo REST API
   if (isBrevoConfigured()) {
     try {
       return await sendBrevoEmail(message);
@@ -200,7 +135,7 @@ async function sendEmail(message) {
   }
 
   const error = new Error(
-    "No email service is configured. Configure BREVO_API_KEY, RESEND_API_KEY, or GMAIL_APP_PASSWORD in backend/.env."
+    "No email service is configured. Configure BREVO_API_KEY or RESEND_API_KEY in backend/.env."
   );
   error.code = "EMAIL_NOT_CONFIGURED";
   throw error;
@@ -481,8 +416,7 @@ module.exports = {
   sendVerificationEmail,
   sendPinRecoveryOtpEmail,
   sendAdminCustomEmail,
-  isEmailConfigured: () => isBrevoConfigured() || isResendConfigured() || isSmtpConfigured(),
+  isEmailConfigured: () => isBrevoConfigured() || isResendConfigured(),
   isBrevoConfigured,
   isResendConfigured,
-  isSmtpConfigured,
 };

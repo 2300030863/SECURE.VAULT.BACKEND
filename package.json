@@ -30,7 +30,6 @@
     "mammoth": "^1.13.0",
     "multer": "^2.4.0",
     "mysql2": "^3.24.5",
-    "nodemailer": "^10.3.1",
     "pdf-parse": "^1.1.1",
     "resend": "^6.37.0",
     "xlsx": "^0.18.5"
