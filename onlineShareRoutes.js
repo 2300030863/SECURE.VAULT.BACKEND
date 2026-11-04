@@ -36,7 +36,7 @@ const connectLimiter = rateLimit({
 // In-Memory Live Session & WebRTC Signaling Store
 // Sessions are ephemeral; no file data is ever stored here.
 // ---------------------------------------------------------------------------
-const PRESENCE_TIMEOUT_MS = 15000; // 15s presence watchdog (owner offline cutoff)
+const PRESENCE_TIMEOUT_MS = 30000; // 30s presence watchdog (owner offline cutoff)
 const activeSessions = new Map(); // sessionId -> Session
 const codeHashToSessionId = new Map(); // accessCodeHash -> sessionId
 
@@ -136,7 +136,7 @@ setInterval(async () => {
   for (const [sessionId, session] of activeSessions.entries()) {
     // 1. Heartbeat timeout detection (30 seconds)
     if (session.status === "active" && now - session.lastHeartbeat > PRESENCE_TIMEOUT_MS) {
-      console.log(`[Online Share Watchdog] Session #${sessionId} owner timed out (no heartbeat for 15s).`);
+      console.log(`[Online Share Watchdog] Session #${sessionId} owner timed out (no heartbeat for 30s).`);
       session.status = "offline";
       try {
         await db.endOnlineShare(sessionId);
