@@ -580,15 +580,19 @@ function getAiConfig(customApiKey) {
   if (isGroq) {
     return {
       provider: "groq",
-      name: "Grok AI",
+      name: "Groq AI",
       apiKey: keyToUse,
       endpoint: "https://api.groq.com/openai/v1/chat/completions",
-      models: [
+      models: Array.from(new Set([
+        process.env.GROQ_MODEL,
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
+        "qwen/qwen3.8-27b",
         "mixtral-8x7b-32768",
         "gemma2-9b-it",
-      ],
+      ].filter(Boolean))),
       supportJsonFormat: true,
     };
   }
@@ -612,7 +616,7 @@ router.get("/email/status", async (_req, res) => {
       configured,
       grokConfigured: Boolean(aiConfig),
       provider: "Brevo Transactional API",
-      aiProvider: aiConfig?.name || "Grok AI",
+      aiProvider: aiConfig?.name || "Groq AI",
       senderEmail: process.env.BREVO_SENDER_EMAIL || null,
       senderName: process.env.BREVO_SENDER_NAME || "DocQevrilo",
     });
@@ -621,203 +625,299 @@ router.get("/email/status", async (_req, res) => {
   }
 });
 
-// Generate Email with Grok AI
+// Generate Email with Groq AI
 router.post("/email/generate-ai", async (req, res) => {
   try {
-    const { prompt, tone = "announcement", targetAudience = "All users", customApiKey } = req.body;
+    const {
+      prompt,
+      tone = "announcement",
+      targetAudience = "All users",
+      customApiKey
+    } = req.body;
+
     if (!prompt || !String(prompt).trim()) {
-      return res.status(400).json({ error: "Please enter a brief or prompt for Grok AI." });
+      return res.status(400).json({
+        error: "Please enter an email instruction."
+      });
     }
 
     const aiConfig = getAiConfig(customApiKey);
+
     if (!aiConfig) {
       return res.status(400).json({
-        error: "Grok API Key not found. Please ensure GROQ_API_KEY or GROK_API_KEY is saved in backend/.env.",
-        needsKey: true,
+        error: "GROQ_API_KEY is missing from backend environment.",
+        needsKey: true
       });
     }
 
-    const systemPrompt = `You are an executive AI communications specialist for DocQevrilo, a zero-knowledge end-to-end encrypted document sharing vault.
-Write high-impact, professional, obsidian-branded administrative emails.
-Your response MUST be a valid JSON object without any commentary or markdown code fences:
+    const validTones = [
+      "announcement",
+      "security",
+      "maintenance",
+      "urgent"
+    ];
+
+    const selectedTone = validTones.includes(
+      String(tone).toLowerCase()
+    ) ? String(tone).toLowerCase() : "announcement";
+
+    const cleanPrompt = String(prompt).trim().slice(0, 3000);
+
+    const systemPrompt = `
+You are DocQevrilo's professional email communication AI.
+
+Your job is to transform short instructions into complete,
+high-quality, professional administrative emails.
+
+IMPORTANT RULES:
+
+1. NEVER copy the user's instruction directly into the email.
+2. Understand what the user wants to communicate.
+3. Expand short instructions into complete, meaningful
+   and natural email content.
+4. A short instruction must produce a complete email,
+   not a one-line message.
+5. Generate an appropriate professional subject.
+6. Start with a suitable greeting.
+7. Include a meaningful introduction.
+8. Explain the intended message clearly.
+9. Include a professional closing and DocQevrilo team signature.
+10. Use paragraphs with proper spacing.
+11. Adapt the writing style to the selected category.
+12. Do not invent features, dates, security incidents,
+    maintenance schedules or completed activities.
+13. If information is missing, use neutral wording
+    instead of making assumptions.
+14. Never include the instruction itself as a sentence
+    unless it is genuinely intended as quoted content.
+
+EMAIL CATEGORY STYLES:
+
+ANNOUNCEMENT:
+Friendly, welcoming, informative and professional.
+
+SECURITY:
+Serious, clear, security-focused and trustworthy.
+Never invent security incidents.
+
+MAINTENANCE:
+Informative and transparent.
+Never invent maintenance dates or downtime.
+
+URGENT:
+Direct, concise and action-oriented.
+Never invent emergencies.
+
+DOCQEVRILO BRAND:
+DocQevrilo is a secure document storage and sharing platform.
+
+OUTPUT REQUIREMENTS:
+
+Return ONLY valid JSON.
+No Markdown.
+No explanations.
+No code fences.
+
+Required JSON structure:
+
 {
-  "subject": "Concise, compelling subject line (under 80 characters)",
-  "message": "Full professional body text with line breaks (\\n\\n) between paragraphs. Do NOT use markdown # headers or HTML tags.",
-  "category": "announcement"
+  "subject": "Professional email subject",
+  "message": "Complete email body with paragraphs",
+  "category": "${selectedTone}"
 }
-Valid values for category are: "announcement", "security", "maintenance", "urgent".`;
+`;
 
-    const userPrompt = `Draft an administrative email based on this specification:
-Topic / Brief: ${String(prompt).trim()}
-Desired Tone: ${tone}
-Audience: ${targetAudience}
-Platform: DocQevrilo (Encrypted Vault & Secure Sharing)`;
+    const userPrompt = `
+Create a complete professional email using these details.
 
-    let aiData = null;
+USER'S INTENTION:
+${cleanPrompt}
+
+EMAIL CATEGORY:
+${selectedTone}
+
+TARGET AUDIENCE:
+${String(targetAudience).slice(0, 100)}
+
+Remember:
+Interpret the intention and write a complete email.
+Do not simply repeat the instruction.
+`;
+
+    let generatedContent = null;
     let successfulModel = null;
     let lastError = null;
 
-    // Try models in order
     for (const model of aiConfig.models) {
       try {
-        const reqBody = {
+        const requestBody = {
           model,
           messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
+            {
+              role: "system",
+              content: systemPrompt
+            },
+            {
+              role: "user",
+              content: userPrompt
+            }
           ],
-          temperature: 0.7,
+          temperature: 0.65,
+          max_tokens: 1200
         };
 
-        if (aiConfig.supportJsonFormat && (model.includes("llama-3") || model.includes("gpt"))) {
-          reqBody.response_format = { type: "json_object" };
+        if (
+          aiConfig.supportJsonFormat &&
+          (model.includes("llama-3") || model.includes("gpt") || model.includes("qwen"))
+        ) {
+          requestBody.response_format = {
+            type: "json_object"
+          };
         }
 
-        const res = await fetch(aiConfig.endpoint, {
+        const response = await fetch(aiConfig.endpoint, {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${aiConfig.apiKey}`,
+            Authorization: `Bearer ${aiConfig.apiKey}`,
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            Accept: "application/json"
           },
-          body: JSON.stringify(reqBody),
+          body: JSON.stringify(requestBody)
         });
 
-        const data = await res.json().catch(() => ({}));
-        if (res.ok && data.choices?.[0]?.message?.content) {
-          aiData = data;
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          lastError =
+            data.error?.message ||
+            `AI provider returned HTTP ${response.status}`;
+
+          console.warn(`[Email AI] ${model}: ${lastError}`);
+          continue;
+        }
+
+        const content =
+          data.choices?.[0]?.message?.content?.trim();
+
+        if (content) {
+          generatedContent = content;
           successfulModel = model;
           break;
-        } else {
-          lastError = data.error?.message || data.message || `API error (${res.status})`;
         }
-      } catch (err) {
-        lastError = err.message;
+
+      } catch (error) {
+        lastError = error.message;
+        console.warn(`[Email AI] ${model}:`, error.message);
       }
     }
 
-    if (!aiData) {
-      // Intelligent fallback when cloud AI model is temporarily unreachable
-      const topic = String(prompt).trim();
-      const subject =
-        tone === "security"
-          ? `[Security Notice] Important Security Update for DocQevrilo Users`
-          : tone === "maintenance"
-          ? `[Scheduled Maintenance] DocQevrilo Infrastructure Optimization`
-          : tone === "urgent"
-          ? `[Urgent Action Required] Important Account Verification Notice`
-          : `DocQevrilo Platform Update: ${topic.slice(0, 50)}`;
-
-      const message =
-        tone === "security"
-          ? `Dear DocQevrilo User,\n\nWe are contacting you with an important security advisory regarding the DocQevrilo document workspace.\n\n${topic}\n\nOur zero-knowledge architecture and single-use cryptographic access controls remain fully active. As a reminder, never share your account recovery keys or password with third parties.\n\nBest regards,\nDocQevrilo Security Team`
-          : tone === "maintenance"
-          ? `Dear DocQevrilo User,\n\nPlease be advised that our engineering team will be conducting routine infrastructure updates.\n\nDetails: ${topic}\n\nAll existing document vaults and cryptographic access keys will remain accessible and safe during this period.\n\nThank you for choosing DocQevrilo,\nDocQevrilo Operations`
-          : `Dear DocQevrilo User,\n\nWe are pleased to share an update regarding our platform:\n\n${topic}\n\nDocQevrilo continues to provide a unified, encrypted digital workspace to store, manage, and share your important files.\n\nBest regards,\nDocQevrilo Administration`;
-
-      const finalCategory = ["security", "maintenance", "urgent"].includes(tone) ? tone : "announcement";
-
-      try {
-        await recordAuditLog(
-          req.admin?.id || 1,
-          "email.ai_generate",
-          null,
-          { prompt: String(prompt).trim().slice(0, 100), model: "offline-ai-engine", category: finalCategory },
-          req.ip
-        );
-      } catch (_) {}
-
-      return res.json({
-        success: true,
-        subject,
-        message,
-        category: finalCategory,
-        model: "DocQevrilo Engine (Offline Resilience)",
-        provider: "Local AI Fallback",
+    // Never pretend that an offline fallback is AI-generated content.
+    if (!generatedContent) {
+      return res.status(502).json({
+        success: false,
+        error: "AI email generation failed. Please check your Groq API key and model availability.",
+        details: lastError
       });
     }
 
-    const rawContent = aiData.choices[0]?.message?.content || "";
-    let parsedResult = null;
+    let parsed;
 
     try {
-      let cleaned = rawContent
+      let cleaned = generatedContent
         .replace(/^```json\s*/i, "")
         .replace(/^```\s*/i, "")
         .replace(/\s*```$/i, "")
         .trim();
 
-      const firstBrace = cleaned.indexOf("{");
-      const lastBrace = cleaned.lastIndexOf("}");
-      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-        cleaned = cleaned.slice(firstBrace, lastBrace + 1);
-      }
-      cleaned = cleaned.replace(/\/\/.*$/gm, "");
-      parsedResult = JSON.parse(cleaned);
-    } catch (_) {
-      const subjectMatch = rawContent.match(/"subject"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/i);
-      const messageMatch = rawContent.match(/"message"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/i);
-      const categoryMatch = rawContent.match(/"category"\s*:\s*"([^"\\]*)"/i);
+      const start = cleaned.indexOf("{");
+      const end = cleaned.lastIndexOf("}");
 
-      const lines = rawContent.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-      parsedResult = {
-        subject: subjectMatch
-          ? subjectMatch[1].replace(/\\"/g, '"')
-          : lines[0] && !lines[0].startsWith("{")
-          ? lines[0].replace(/^(subject:\s*|#\s*)/i, "")
-          : `DocQevrilo Update: ${String(prompt).slice(0, 40)}`,
-        message: messageMatch
-          ? messageMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"')
-          : lines.slice(1).join("\n\n") || rawContent,
-        category: categoryMatch
-          ? categoryMatch[1]
-          : ["security", "maintenance", "urgent"].includes(tone)
-          ? tone
-          : "announcement",
-      };
+      if (start !== -1 && end > start) {
+        cleaned = cleaned.slice(start, end + 1);
+      }
+
+      parsed = JSON.parse(cleaned);
+
+    } catch (error) {
+      console.warn("[Email AI JSON Strict Error]", error.message);
+
+      // Resilient regex extractor if unescaped quotes or line breaks were in JSON
+      const subjectMatch = generatedContent.match(/"subject"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/i);
+      const messageMatch =
+        generatedContent.match(/"message"\s*:\s*"([\s\S]*?)"\s*,\s*"category"/i) ||
+        generatedContent.match(/"message"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/i);
+      const categoryMatch = generatedContent.match(/"category"\s*:\s*"([^"\\]*)"/i);
+
+      if (subjectMatch && messageMatch) {
+        parsed = {
+          subject: subjectMatch[1].replace(/\\"/g, '"'),
+          message: messageMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'),
+          category: categoryMatch ? categoryMatch[1] : selectedTone
+        };
+      } else {
+        return res.status(502).json({
+          success: false,
+          error: "AI returned an invalid email format. Please try again."
+        });
+      }
     }
 
-    const finalSubject =
-      parsedResult?.subject ||
-      parsedResult?.title ||
-      parsedResult?.email_subject ||
-      `DocQevrilo Platform Notice`;
+    const subject = String(parsed.subject || parsed.title || "").trim();
+    const message = String(
+      parsed.message || parsed.body || parsed.content || ""
+    ).trim();
 
-    const finalMessage =
-      parsedResult?.message ||
-      parsedResult?.body ||
-      parsedResult?.content ||
-      parsedResult?.text ||
-      parsedResult?.email_body ||
-      "";
+    if (!subject || !message || message.length < 80) {
+      return res.status(502).json({
+        success: false,
+        error: "AI generated incomplete email content. Please try again."
+      });
+    }
 
-    const finalCategory = ["announcement", "security", "maintenance", "urgent"].includes(parsedResult?.category)
-      ? parsedResult.category
-      : ["announcement", "security", "maintenance", "urgent"].includes(tone)
-      ? tone
-      : "announcement";
+    // Prevent the exact instruction from being returned as the email.
+    if (message.toLowerCase() === cleanPrompt.toLowerCase()) {
+      return res.status(502).json({
+        success: false,
+        error: "AI repeated the instruction instead of generating an email."
+      });
+    }
+
+    const finalCategory = validTones.includes(parsed.category)
+      ? parsed.category
+      : selectedTone;
 
     try {
       await recordAuditLog(
         req.admin?.id || 1,
         "email.ai_generate",
         null,
-        { prompt: String(prompt).trim().slice(0, 100), model: successfulModel, category: finalCategory },
+        {
+          prompt: cleanPrompt.slice(0, 100),
+          model: successfulModel,
+          category: finalCategory
+        },
         req.ip
       );
-    } catch (_) {}
+    } catch (error) {
+      console.warn("[Email AI Audit]", error.message);
+    }
 
     return res.json({
       success: true,
-      subject: finalSubject,
-      message: finalMessage,
+      subject,
+      message,
       category: finalCategory,
       model: successfulModel,
-      provider: aiConfig.name || "Groq AI",
+      provider: aiConfig.name
     });
-  } catch (err) {
-    console.error("[Grok AI Error]", err.message);
-    res.status(500).json({ error: err.message || "Failed to generate email with Grok AI." });
+
+  } catch (error) {
+    console.error("[Email AI Error]", error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to generate email. Please try again."
+    });
   }
 });
 

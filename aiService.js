@@ -19,8 +19,11 @@ const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const CANDIDATE_MODELS = Array.from(
   new Set([
     process.env.GROQ_MODEL,
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
+    "qwen/qwen3.8-27b",
     "llama3-70b-8192",
     "llama3-8b-8192",
     "mixtral-8x7b-32768",
