@@ -14,7 +14,7 @@ async function sendTestEmail() {
 
   if (!senderEmail || senderEmail === "your_verified_sender_email") {
     console.error("❌ Error: BREVO_SENDER_EMAIL is not set in backend/.env.");
-    console.log("👉 Please set your verified Brevo sender email in backend/.env (e.g. BREVO_SENDER_EMAIL=otp@kommalaptisivesh.me)");
+    console.log("👉 Please set your verified Brevo sender email in backend/.env (e.g. BREVO_SENDER_EMAIL=otp@kommalapatisivesh.me)");
     return;
   }
 
