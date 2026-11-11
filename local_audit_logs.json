@@ -1,8 +1,8 @@
 [
   {
     "id": 3,
-    "admin_id": 1,
-    "admin_email": "admin@docqevrilo.com",
+    "admin_id": 120001,
+    "admin_email": "siveshkommalapati9652@gmail.com",
     "action": "email.ai_generate",
     "target_user_id": null,
     "details": {
@@ -15,8 +15,8 @@
   },
   {
     "id": 2,
-    "admin_id": 1,
-    "admin_email": "admin@docqevrilo.com",
+    "admin_id": 120001,
+    "admin_email": "siveshkommalapati9652@gmail.com",
     "action": "email.ai_generate",
     "target_user_id": null,
     "details": {
@@ -29,8 +29,8 @@
   },
   {
     "id": 1,
-    "admin_id": 1,
-    "admin_email": "admin@docqevrilo.com",
+    "admin_id": 120001,
+    "admin_email": "siveshkommalapati9652@gmail.com",
     "action": "test.verification",
     "target_user_id": null,
     "details": {

@@ -1448,7 +1448,7 @@ async function recordAuditLog(adminId, action, targetUserId, details, ip) {
   logs.unshift({
     id: logs.length ? Math.max(...logs.map((l) => l.id || 0)) + 1 : 1,
     admin_id: adminId,
-    admin_email: admin ? admin.email : "admin@docqevrilo.com",
+    admin_email: admin ? admin.email : (process.env.ADMIN_EMAIL || "siveshkommalapati9652@gmail.com"),
     action,
     target_user_id: targetUserId || null,
     details: details || {},
@@ -1475,7 +1475,7 @@ async function getAuditLogs(limit = 50) {
       const admin = users.find((u) => Number(u.id) === Number(l.admin_id));
       return {
         ...l,
-        admin_email: l.admin_email || (admin ? admin.email : "admin@docqevrilo.com"),
+        admin_email: l.admin_email || (admin ? admin.email : (process.env.ADMIN_EMAIL || "siveshkommalapati9652@gmail.com")),
       };
     });
   }

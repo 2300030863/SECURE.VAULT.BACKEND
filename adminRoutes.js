@@ -88,7 +88,7 @@ async function bootstrapAdmin() {
   const name = String(process.env.ADMIN_NAME || "Administrator").trim();
 
   // If no ADMIN_EMAIL is configured in .env, do not auto-seed any default admin
-  if (!email || !password) {
+  if (!email) {
     return;
   }
 
@@ -100,6 +100,10 @@ async function bootstrapAdmin() {
         await updateUserStatus(existing.id, "active");
         console.log(`[Admin] Existing account ${email} upgraded to active admin.`);
       }
+      return;
+    }
+
+    if (!password) {
       return;
     }
 
