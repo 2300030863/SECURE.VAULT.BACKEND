@@ -196,12 +196,73 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
   }
 });
 
+// GET /api/auth/verify-reset-token
+// Validates whether an email reset token is still active (< 15 mins and unused)
+router.get("/verify-reset-token", async (req, res) => {
+  const token = typeof req.query.token === "string" ? req.query.token.trim() : "";
+
+  if (!token || !/^[a-f0-9]{64}$/i.test(token)) {
+    return res.status(400).json({
+      valid: false,
+      expired: true,
+      message: "A valid email reset verification link is required.",
+    });
+  }
+
+  try {
+    const tokenHash = hashToken(token);
+    const [rows] = await db.execute(
+      `SELECT id, user_id, email, expires_at, used_at FROM password_reset_tokens 
+       WHERE token_hash = ? ORDER BY id DESC LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({
+        valid: false,
+        expired: true,
+        message: "This password reset link is invalid or has already been used.",
+      });
+    }
+
+    const rec = rows[0];
+    const isUsed = Boolean(rec.used_at);
+    const isTimeExpired = new Date(rec.expires_at).getTime() <= Date.now();
+
+    if (isUsed || isTimeExpired) {
+      return res.status(410).json({
+        valid: false,
+        expired: true,
+        isUsed,
+        message: isUsed
+          ? "This reset link has already been used and cannot be reused. Please request a new link if needed."
+          : "This password reset link has expired after 15 minutes. Please request a new link.",
+      });
+    }
+
+    const remainingMs = Math.max(0, new Date(rec.expires_at).getTime() - Date.now());
+
+    return res.json({
+      valid: true,
+      email: rec.email,
+      expiresAt: rec.expires_at,
+      remainingSeconds: Math.floor(remainingMs / 1000),
+    });
+  } catch (error) {
+    console.error("[Verify Reset Token Error]:", error.message);
+    return res.status(500).json({
+      valid: false,
+      error: "Unable to verify reset link.",
+    });
+  }
+});
+
 // POST /api/auth/reset-password
-// Supports both 6-digit OTP code verification AND token link verification!
+// Requires valid token verification from email link
 router.post("/reset-password", resetLimiter, async (req, res) => {
   const { token, email, otp, password } = req.body;
 
-  // Validation: Must provide either a 64-char hex token OR (email + 6-digit OTP)
+  // Validation: Must provide a 64-char hex token from the email verification link (or email + 6-digit OTP from email)
   const hasToken = typeof token === "string" && /^[a-f0-9]{64}$/i.test(token.trim());
   const hasOtp =
     typeof email === "string" &&
@@ -211,7 +272,8 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
 
   if (!hasToken && !hasOtp) {
     return res.status(400).json({
-      message: "Please provide a valid 6-digit OTP code with your email, or use a valid reset link.",
+      message: "Please open the direct reset link sent to your email to choose a new password.",
+      expired: true,
     });
   }
 
@@ -233,8 +295,18 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
 
     let rows = [];
 
-    if (hasOtp) {
-      // Find valid record by Email + Hashed OTP (with fallback to plaintext otp_code for legacy tokens)
+    if (hasToken) {
+      // Find valid record by 64-char Token Hash
+      const tokenHash = hashToken(token.trim());
+      const [found] = await connection.execute(
+        `SELECT id, user_id, email FROM password_reset_tokens 
+         WHERE token_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP() 
+         LIMIT 1 FOR UPDATE`,
+        [tokenHash]
+      );
+      rows = found;
+    } else {
+      // Find valid record by Email + Hashed OTP
       const cleanEmail = email.trim().toLowerCase();
       const cleanOtp = otp.trim();
       const cleanOtpHash = hashToken(cleanOtp);
@@ -246,22 +318,12 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
         [cleanEmail, cleanOtpHash, cleanOtp]
       );
       rows = found;
-    } else {
-      // Find valid record by 64-char Token Hash
-      const tokenHash = hashToken(token.trim());
-      const [found] = await connection.execute(
-        `SELECT id, user_id, email FROM password_reset_tokens 
-         WHERE token_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP() 
-         LIMIT 1 FOR UPDATE`,
-        [tokenHash]
-      );
-      rows = found;
     }
 
     if (!rows || rows.length === 0) {
       await connection.rollback();
       return res.status(400).json({
-        message: "Invalid or expired OTP / reset link. Password reset links and OTP codes expire strictly after 15 minutes. Please request a new one.",
+        message: "Invalid or expired reset link. Reset links expire strictly after 15 minutes or after being used. Please request a new one.",
         expired: true,
       });
     }
@@ -281,16 +343,16 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
       throw new Error("User account could not be updated");
     }
 
-    // Mark current token/OTP as consumed
+    // Mark current token/OTP as consumed immediately
     await connection.execute(
       "UPDATE password_reset_tokens SET used_at = UTC_TIMESTAMP() WHERE id = ?",
       [resetRecord.id]
     );
 
-    // Invalidate any remaining reset records for this user
+    // Immediately purge all reset tokens for this user so the link can NEVER be reused
     await connection.execute(
-      "DELETE FROM password_reset_tokens WHERE user_id = ? AND id <> ?",
-      [resetRecord.user_id, resetRecord.id]
+      "DELETE FROM password_reset_tokens WHERE user_id = ?",
+      [resetRecord.user_id]
     );
 
     await connection.commit();
@@ -300,6 +362,7 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
     }
 
     return res.json({
+      success: true,
       message: "Password reset successfully! You can now sign in with your new password.",
     });
   } catch (error) {
