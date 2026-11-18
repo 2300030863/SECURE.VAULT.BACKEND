@@ -71,7 +71,13 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
 
     if (!users || users.length === 0) {
       return res.json({
-        message: genericMessage,
+        success: true,
+        emailSent: true,
+        message: `If an account exists for ${email}, a password reset link and 6-digit verification code have been dispatched.`,
+        email: email,
+        expiresInMinutes: 15,
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        expiresTimestamp: Date.now() + 15 * 60 * 1000,
         isEmailConfigured: isEmailConfigured(),
       });
     }
@@ -87,7 +93,8 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
     const tokenHash = hashToken(token);
 
     // Token & OTP expire strictly in 15 minutes
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    const expiresTimestamp = Date.now() + 15 * 60 * 1000;
+    const expiresAt = new Date(expiresTimestamp);
     const expiresAtSql = expiresAt.toISOString().slice(0, 19).replace("T", " ");
 
     // Invalidate any older unused reset tokens for this user
@@ -121,9 +128,11 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
     const resetUrl = new URL("/reset-password", frontendUrl);
     resetUrl.searchParams.set("token", token);
     resetUrl.searchParams.set("email", user.email);
+    resetUrl.searchParams.set("otp", otpCode);
+    resetUrl.searchParams.set("exp", String(expiresTimestamp));
 
     console.log(`\n======================================================`);
-    console.log(`🔑 [FORGOT PASSWORD OTP] Code for ${user.email}: [ ${otpCode} ]`);
+    console.log(`🔑 [FORGOT PASSWORD OTP] Code for ${user.email}: [ ${otpCode} ] (Expires in 15m)`);
     console.log(`======================================================\n`);
 
     let mailResult;
@@ -148,6 +157,9 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
           success: true,
           emailSent: false,
           devOtp: otpCode,
+          email: user.email,
+          expiresInMinutes: 15,
+          expiresTimestamp,
           message: isBrevoIpBlocked
             ? `Brevo IP authorization needed (IP blocked). For testing, your OTP code is: ${otpCode} (also check backend terminal).`
             : `Email delivery issue. For testing, your OTP code is: ${otpCode} (also check backend terminal).`,
@@ -170,8 +182,11 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
     return res.json({
       success: true,
       emailSent: true,
-      message: `A 6-digit OTP verification code has been sent to ${user.email}. Please check your email inbox.`,
+      message: `A 6-digit OTP verification code and reset link have been dispatched to ${user.email}. Please check your email inbox.`,
       email: user.email,
+      expiresInMinutes: 15,
+      expiresAt: expiresAt.toISOString(),
+      expiresTimestamp,
     });
   } catch (error) {
     console.error("[Forgot Password Error]:", error.message);
@@ -246,7 +261,8 @@ router.post("/reset-password", resetLimiter, async (req, res) => {
     if (!rows || rows.length === 0) {
       await connection.rollback();
       return res.status(400).json({
-        message: "Invalid or expired OTP / reset link. Please request a new one.",
+        message: "Invalid or expired OTP / reset link. Password reset links and OTP codes expire strictly after 15 minutes. Please request a new one.",
+        expired: true,
       });
     }
 

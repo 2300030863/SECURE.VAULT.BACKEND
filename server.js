@@ -511,9 +511,27 @@ function hashOtpCode(code) {
   return crypto.createHash("sha256").update(code).digest("hex");
 }
 
-async function issueAccountOtp(user, purpose, sendEmail) {
+function getFrontendUrl(req) {
+  let callerOrigin = null;
+  if (req?.headers?.origin) {
+    callerOrigin = req.headers.origin;
+  } else if (req?.headers?.referer) {
+    try {
+      callerOrigin = new URL(req.headers.referer).origin;
+    } catch (_) {}
+  }
+  return (
+    callerOrigin ||
+    process.env.FRONTEND_URL ||
+    process.env.FRONTEND_ORIGIN ||
+    "http://localhost:5173"
+  );
+}
+
+async function issueAccountOtp(user, purpose, sendEmail, req = null) {
   const otpCode = createOtpCode();
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
+  const expiresTimestamp = Date.now() + 10 * 60 * 1000;
+  const expiresAt = new Date(expiresTimestamp)
     .toISOString()
     .slice(0, 19)
     .replace("T", " ");
@@ -531,20 +549,31 @@ async function issueAccountOtp(user, purpose, sendEmail) {
   } else {
     accountOtpMemory.set(`${user.id}:${purpose}`, {
       hash: hashOtpCode(otpCode),
-      expiresAt: Date.now() + 10 * 60 * 1000,
+      expiresAt: expiresTimestamp,
     });
   }
 
   console.log(`\n======================================================`);
-  console.log(`🔑 [ACCOUNT OTP] Code for ${user.email} (${purpose}): [ ${otpCode} ]`);
+  console.log(`🔑 [ACCOUNT OTP] Code for ${user.email} (${purpose}): [ ${otpCode} ] (Expires in 10m)`);
   console.log(`======================================================\n`);
 
+  const frontendUrl = getFrontendUrl(req);
+  let actionUrl = "";
+  if (purpose === "email_verification") {
+    const url = new URL("/register", frontendUrl);
+    url.searchParams.set("verify", user.email);
+    url.searchParams.set("email", user.email);
+    url.searchParams.set("otp", otpCode);
+    url.searchParams.set("exp", String(expiresTimestamp));
+    actionUrl = url.toString();
+  }
+
   try {
-    await sendEmail(user.email, otpCode);
-    return { success: true, emailSent: true, otpCode };
+    await sendEmail(user.email, otpCode, actionUrl, 10);
+    return { success: true, emailSent: true, otpCode, expiresTimestamp };
   } catch (emailErr) {
     console.warn(`[Account OTP Email Warning] Could not deliver ${purpose} email to ${user.email}: ${emailErr.message}`);
-    return { success: true, emailSent: false, error: emailErr.message, otpCode };
+    return { success: true, emailSent: false, error: emailErr.message, otpCode, expiresTimestamp };
   }
 }
 
@@ -664,7 +693,8 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
     }
 
     const otpCode = createOtpCode();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString().slice(0, 19).replace("T", " ");
+    const expiresTimestamp = Date.now() + 10 * 60 * 1000;
+    const expiresAt = new Date(expiresTimestamp).toISOString().slice(0, 19).replace("T", " ");
 
     const pool = await db.getPool();
     if (pool) {
@@ -679,19 +709,26 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
     } else {
       accountOtpMemory.set(`reg:${email}:email_verification`, {
         hash: hashOtpCode(otpCode),
-        expiresAt: Date.now() + 10 * 60 * 1000,
+        expiresAt: expiresTimestamp,
       });
     }
 
+    const frontendUrl = getFrontendUrl(req);
+    const verifyUrl = new URL("/register", frontendUrl);
+    verifyUrl.searchParams.set("email", email);
+    verifyUrl.searchParams.set("otp", otpCode);
+    verifyUrl.searchParams.set("exp", String(expiresTimestamp));
+
     console.log(`\n======================================================`);
-    console.log(`🔑 [INLINE REGISTRATION OTP] Code for ${email}: [ ${otpCode} ]`);
+    console.log(`🔑 [INLINE REGISTRATION OTP] Code for ${email}: [ ${otpCode} ] (Expires in 10m)`);
+    console.log(`🔗 [VERIFY LINK] ${verifyUrl.toString()}`);
     console.log(`======================================================\n`);
 
     let emailSent = false;
     let emailErrorMsg = "";
 
     try {
-      await sendVerificationEmail(email, otpCode);
+      await sendVerificationEmail(email, otpCode, verifyUrl.toString(), 10);
       emailSent = true;
     } catch (emailErr) {
       console.warn("[Email Send Warning]:", emailErr.message);
@@ -708,6 +745,9 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
           success: true,
           emailSent: false,
           devOtp: otpCode,
+          email,
+          expiresInMinutes: 10,
+          expiresTimestamp,
           message: isBrevoIpBlocked
             ? `Brevo IP authorization needed (IP blocked). For testing, your OTP code is: ${otpCode} (also check backend terminal).`
             : `Email delivery issue. For testing, your OTP code is: ${otpCode} (also check backend terminal).`,
@@ -726,6 +766,9 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
       success: true,
       emailSent: true,
       message: `A 6-digit verification code has been sent to ${email}.`,
+      email,
+      expiresInMinutes: 10,
+      expiresTimestamp,
       attemptsRemaining: rateLimitCheck.attemptsRemaining,
     });
   } catch (err) {
