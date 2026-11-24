@@ -1,4 +1,5 @@
 const mysql = require("mysql2/promise");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
@@ -375,9 +376,49 @@ async function initDatabase() {
       await safeAddColumn(pool, "online_shares", "last_heartbeat", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
       await safeAddColumn(pool, "online_shares", "expires_at", "DATETIME NOT NULL");
       await safeAddColumn(pool, "online_shares", "ended_at", "DATETIME NULL");
+      await safeAddColumn(pool, "online_shares", "reserved_slots", "INT NOT NULL DEFAULT 0");
+      await safeAddColumn(pool, "online_shares", "owner_token_hash", "CHAR(64) NULL");
       await safeAddIndex(pool, "online_shares", "idx_online_code_hash", "(access_code_hash)");
       await safeAddIndex(pool, "online_shares", "idx_online_owner", "(owner_id, session_status)");
       await safeAddIndex(pool, "online_shares", "idx_online_heartbeat", "(last_heartbeat)");
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS online_share_recipients (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          session_id BIGINT NOT NULL,
+          recipient_id VARCHAR(64) NOT NULL,
+          recipient_token_hash CHAR(64) NOT NULL,
+          status VARCHAR(30) NOT NULL DEFAULT 'connected',
+          bytes_transferred BIGINT NOT NULL DEFAULT 0,
+          download_completed BOOLEAN NOT NULL DEFAULT FALSE,
+          reservation_id VARCHAR(64) NULL,
+          lease_version INT NOT NULL DEFAULT 0,
+          lease_expires_at BIGINT NOT NULL DEFAULT 0,
+          connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          completed_at DATETIME NULL,
+          INDEX idx_osr_session (session_id),
+          INDEX idx_osr_recipient (recipient_id),
+          INDEX idx_osr_status (status)
+        );
+      `);
+
+      await safeAddColumn(pool, "online_share_recipients", "reservation_id", "VARCHAR(64) NULL");
+      await safeAddColumn(pool, "online_share_recipients", "lease_version", "INT NOT NULL DEFAULT 0");
+      await safeAddColumn(pool, "online_share_recipients", "lease_expires_at", "BIGINT NOT NULL DEFAULT 0");
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS online_share_tickets (
+          ticket VARCHAR(128) PRIMARY KEY,
+          session_id BIGINT NOT NULL,
+          token VARCHAR(256) NOT NULL,
+          role VARCHAR(32) NOT NULL,
+          recipient_id VARCHAR(128) NULL,
+          expires_at BIGINT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_ost_expires (expires_at)
+        );
+      `);
 
       isTiDBConnected = true;
       dbMode = "tidb_cloud";
@@ -1559,6 +1600,7 @@ async function removeOtpRateLimitRecord(key) {
 async function createOnlineShare({
   owner_id,
   access_code_hash,
+  owner_token_hash = null,
   file_name,
   file_size,
   mime_type = "application/octet-stream",
@@ -1575,13 +1617,14 @@ async function createOnlineShare({
   if (isTiDBConnected && pool) {
     const [result] = await pool.query(
       `INSERT INTO online_shares
-        (owner_id, access_code_hash, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at)
-       VALUES (?, ?, ?, ?, ?, 'active', 0, 0, ?, ?, NOW(), NOW(), ?)`,
-      [owner_id || null, access_code_hash, file_name, file_size, normMime, maxDlVal, delAfterVal, expDate]
+        (owner_id, access_code_hash, owner_token_hash, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'active', 0, 0, ?, ?, NOW(), NOW(), ?)`,
+      [owner_id || null, access_code_hash, owner_token_hash || null, file_name, file_size, normMime, maxDlVal, delAfterVal, expDate]
     );
     return {
       id: result.insertId,
       owner_id,
+      owner_token_hash,
       file_name,
       file_size,
       mime_type: normMime,
@@ -1601,6 +1644,7 @@ async function createOnlineShare({
     id: Date.now(),
     owner_id: owner_id || null,
     access_code_hash,
+    owner_token_hash,
     file_name,
     file_size,
     mime_type: normMime,
@@ -1622,7 +1666,7 @@ async function createOnlineShare({
 async function findOnlineShareByHash(codeHash) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, owner_id, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at, ended_at
+      `SELECT id, owner_id, owner_token_hash, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at, ended_at
        FROM online_shares
        WHERE access_code_hash = ?
        ORDER BY id DESC LIMIT 1`,
@@ -1637,7 +1681,7 @@ async function findOnlineShareByHash(codeHash) {
 async function findOnlineShareById(id) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
-      `SELECT id, owner_id, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at, ended_at
+      `SELECT id, owner_id, owner_token_hash, file_name, file_size, mime_type, session_status, view_count, download_count, max_downloads, delete_after_download, created_at, last_heartbeat, expires_at, ended_at
        FROM online_shares
        WHERE id = ? LIMIT 1`,
       [id]
@@ -1730,6 +1774,10 @@ async function markExpiredOnlineShares() {
        WHERE session_status = 'active'
          AND (last_heartbeat < (NOW() - INTERVAL 30 SECOND) OR expires_at < NOW())`
     );
+    // Also clean up expired SSE tickets
+    try {
+      await pool.query(`DELETE FROM online_share_tickets WHERE expires_at <= ?`, [Date.now()]);
+    } catch (_) {}
     return result.affectedRows || 0;
   }
   const shares = loadLocalOnlineShares();
@@ -1750,6 +1798,25 @@ async function markExpiredOnlineShares() {
   return count;
 }
 
+async function getOnlineShareRecipients(sessionId) {
+  if (isTiDBConnected && pool) {
+    try {
+      const [rows] = await pool.query(
+        `SELECT recipient_id, recipient_token_hash, status, bytes_transferred, download_completed, reservation_id, lease_version, lease_expires_at
+         FROM online_share_recipients
+         WHERE session_id = ?`,
+        [sessionId]
+      );
+      return rows || [];
+    } catch (_) {
+      return [];
+    }
+  }
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(sessionId));
+  return (share && share.recipients) ? share.recipients : [];
+}
+
 async function listActiveOnlineSharesByOwner(ownerId) {
   if (isTiDBConnected && pool) {
     const [rows] = await pool.query(
@@ -1768,6 +1835,441 @@ async function listActiveOnlineSharesByOwner(ownerId) {
     const hbTime = new Date(s.last_heartbeat).getTime();
     return now - hbTime <= 30000;
   });
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Recipient Online Share Tracking (Persistent Store & Local Fallback)
+// ---------------------------------------------------------------------------
+
+async function registerOnlineShareRecipient({ sessionId, recipientId, recipientTokenHash, status = 'connected' }) {
+  if (!sessionId || !recipientId) return;
+  if (isTiDBConnected && pool) {
+    try {
+      await pool.query(
+        `INSERT INTO online_share_recipients
+          (session_id, recipient_id, recipient_token_hash, status, bytes_transferred, download_completed, connected_at, last_seen)
+         VALUES (?, ?, ?, ?, 0, FALSE, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE last_seen = NOW(), status = VALUES(status)`,
+        [sessionId, recipientId, recipientTokenHash, status]
+      );
+    } catch (_) {}
+    return;
+  }
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(sessionId));
+  if (share) {
+    if (!share.recipients) share.recipients = [];
+    const existing = share.recipients.find((r) => r.recipient_id === recipientId);
+    if (existing) {
+      existing.last_seen = new Date().toISOString();
+      existing.status = status;
+    } else {
+      share.recipients.push({
+        recipient_id: recipientId,
+        recipient_token_hash: recipientTokenHash,
+        status,
+        bytes_transferred: 0,
+        download_completed: false,
+        connected_at: new Date().toISOString(),
+        last_seen: new Date().toISOString(),
+      });
+    }
+    saveLocalOnlineShares(shares);
+  }
+}
+
+async function updateOnlineShareRecipient({ sessionId, recipientId, status, bytesTransferred }) {
+  if (!sessionId || !recipientId) return;
+  if (isTiDBConnected && pool) {
+    try {
+      const updates = [];
+      const params = [];
+      if (status) {
+        updates.push("status = ?");
+        params.push(status);
+      }
+      if (Number.isFinite(bytesTransferred)) {
+        updates.push("bytes_transferred = ?");
+        params.push(bytesTransferred);
+      }
+      updates.push("last_seen = NOW()");
+      params.push(sessionId, recipientId);
+      await pool.query(
+        `UPDATE online_share_recipients SET ${updates.join(", ")} WHERE session_id = ? AND recipient_id = ?`,
+        params
+      );
+    } catch (_) {}
+    return;
+  }
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(sessionId));
+  if (share && share.recipients) {
+    const recip = share.recipients.find((r) => r.recipient_id === recipientId);
+    if (recip) {
+      if (status) recip.status = status;
+      if (Number.isFinite(bytesTransferred)) recip.bytes_transferred = bytesTransferred;
+      recip.last_seen = new Date().toISOString();
+      saveLocalOnlineShares(shares);
+    }
+  }
+}
+
+async function recordOnlineShareDownloadAtomic(sessionId, recipientId) {
+  if (!sessionId) return { success: false, newDownloadCount: 0, alreadyCompleted: false };
+  if (isTiDBConnected && pool) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      let alreadyCompleted = false;
+      if (recipientId) {
+        const [recipRows] = await conn.query(
+          `SELECT download_completed FROM online_share_recipients WHERE session_id = ? AND recipient_id = ? FOR UPDATE`,
+          [sessionId, recipientId]
+        );
+        if (recipRows && recipRows.length > 0 && recipRows[0].download_completed) {
+          alreadyCompleted = true;
+        }
+      }
+
+      if (!alreadyCompleted) {
+        await conn.query(
+          `UPDATE online_shares SET download_count = COALESCE(download_count, 0) + 1, reserved_slots = GREATEST(0, COALESCE(reserved_slots, 0) - 1) WHERE id = ?`,
+          [sessionId]
+        );
+        if (recipientId) {
+          await conn.query(
+            `UPDATE online_share_recipients SET download_completed = TRUE, status = 'completed', completed_at = NOW(), last_seen = NOW() WHERE session_id = ? AND recipient_id = ?`,
+            [sessionId, recipientId]
+          );
+        }
+      }
+
+      const [shareRows] = await conn.query(
+        `SELECT download_count, max_downloads, delete_after_download FROM online_shares WHERE id = ?`,
+        [sessionId]
+      );
+      await conn.commit();
+
+      const newDownloadCount = shareRows && shareRows[0] ? shareRows[0].download_count : 1;
+      return {
+        success: true,
+        newDownloadCount,
+        alreadyCompleted,
+        maxDownloads: shareRows && shareRows[0] ? shareRows[0].max_downloads : "unlimited",
+        deleteAfterDownload: shareRows && shareRows[0] ? Boolean(shareRows[0].delete_after_download) : false,
+      };
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  // Local JSON fallback
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(sessionId));
+  if (!share) return { success: false, newDownloadCount: 0, alreadyCompleted: false };
+
+  let alreadyCompleted = false;
+  if (share.recipients && recipientId) {
+    const recip = share.recipients.find((r) => r.recipient_id === recipientId);
+    if (recip && recip.download_completed) {
+      alreadyCompleted = true;
+    } else if (recip) {
+      recip.download_completed = true;
+      recip.status = 'completed';
+      recip.completed_at = new Date().toISOString();
+    }
+  }
+
+  if (!alreadyCompleted) {
+    share.download_count = (share.download_count || 0) + 1;
+    share.reserved_slots = Math.max(0, (share.reserved_slots || 0) - 1);
+    saveLocalOnlineShares(shares);
+  }
+
+  return {
+    success: true,
+    newDownloadCount: share.download_count || 1,
+    alreadyCompleted,
+    maxDownloads: share.max_downloads || "unlimited",
+    deleteAfterDownload: Boolean(share.delete_after_download),
+  };
+}
+
+let localOnlineTickets = new Map();
+
+async function saveOnlineShareTicket({ ticket, sessionId, token, role, recipientId = null, ttlSeconds = 60 }) {
+  const expiresAt = Date.now() + ttlSeconds * 1000;
+  if (isTiDBConnected && pool) {
+    try {
+      await pool.query(
+        `INSERT INTO online_share_tickets (ticket, session_id, token, role, recipient_id, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)`,
+        [ticket, sessionId, token, role, recipientId || null, expiresAt]
+      );
+      return { ticket, expiresAt };
+    } catch (e) {
+      console.warn("[TiDB Ticket Warning] Falling back to memory ticket:", e.message);
+    }
+  }
+  localOnlineTickets.set(ticket, {
+    sessionId: Number(sessionId),
+    token,
+    role,
+    recipientId: recipientId || null,
+    expiresAt,
+  });
+  return { ticket, expiresAt };
+}
+
+async function consumeOnlineShareTicket(ticket, requestedSessionId = null, requestedRecipientId = null) {
+  const now = Date.now();
+  if (isTiDBConnected && pool) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [rows] = await conn.query(
+        `SELECT ticket, session_id, token, role, recipient_id, expires_at 
+         FROM online_share_tickets 
+         WHERE ticket = ? AND expires_at > ? FOR UPDATE`,
+        [ticket, now]
+      );
+      if (!rows || rows.length === 0) {
+        await conn.rollback();
+        // Check memory fallback in case it was stored there
+        const memRec = localOnlineTickets.get(ticket);
+        if (memRec && memRec.expiresAt > now) {
+          localOnlineTickets.delete(ticket);
+          if (requestedSessionId && Number(requestedSessionId) !== memRec.sessionId) return null;
+          if (requestedRecipientId && requestedRecipientId !== memRec.recipientId) return null;
+          return memRec;
+        }
+        return null;
+      }
+      const record = rows[0];
+      if (requestedSessionId && Number(requestedSessionId) !== Number(record.session_id)) {
+        await conn.rollback();
+        return null;
+      }
+      if (requestedRecipientId && requestedRecipientId !== record.recipient_id) {
+        await conn.rollback();
+        return null;
+      }
+      await conn.query(`DELETE FROM online_share_tickets WHERE ticket = ?`, [ticket]);
+      await conn.commit();
+      return {
+        ticket: record.ticket,
+        sessionId: Number(record.session_id),
+        token: record.token,
+        role: record.role,
+        recipientId: record.recipient_id,
+        expiresAt: Number(record.expires_at),
+      };
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  // Local fallback
+  const record = localOnlineTickets.get(ticket);
+  if (!record || record.expiresAt <= now) {
+    localOnlineTickets.delete(ticket);
+    return null;
+  }
+  if (requestedSessionId && Number(requestedSessionId) !== record.sessionId) {
+    return null;
+  }
+  if (requestedRecipientId && requestedRecipientId !== record.recipientId) {
+    return null;
+  }
+  localOnlineTickets.delete(ticket); // Atomic single-use delete
+  return record;
+}
+
+async function reserveOnlineShareSlot(sessionId, recipientId, reservationId = null) {
+  const rsvId = reservationId || `rsv_${crypto.randomBytes(12).toString("hex")}`;
+  const leaseVersion = 1;
+  const leaseExpiresAt = Date.now() + 45000;
+
+  if (isTiDBConnected && pool) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      const [rows] = await conn.query(
+        `SELECT download_count, reserved_slots, max_downloads FROM online_shares WHERE id = ? FOR UPDATE`,
+        [sessionId]
+      );
+
+      if (!rows || rows.length === 0) {
+        await conn.rollback();
+        return { success: false, reason: "session_not_found" };
+      }
+
+      const { download_count, reserved_slots, max_downloads } = rows[0];
+      const curDownloads = Number(download_count) || 0;
+      const curReserved = Number(reserved_slots) || 0;
+
+      if (max_downloads && max_downloads !== "unlimited" && (curDownloads + curReserved) >= Number(max_downloads)) {
+        await conn.rollback();
+        return {
+          success: false,
+          reason: "limit_reached",
+          downloadCount: curDownloads,
+          reservedSlots: curReserved,
+          maxDownloads,
+        };
+      }
+
+      await conn.query(
+        `UPDATE online_shares SET reserved_slots = COALESCE(reserved_slots, 0) + 1 WHERE id = ?`,
+        [sessionId]
+      );
+
+      if (recipientId) {
+        await conn.query(
+          `UPDATE online_share_recipients 
+           SET status = 'reserved', 
+               reservation_id = ?, 
+               lease_version = ?, 
+               lease_expires_at = ?, 
+               last_seen = NOW() 
+           WHERE session_id = ? AND recipient_id = ?`,
+          [rsvId, leaseVersion, leaseExpiresAt, sessionId, recipientId]
+        );
+      }
+
+      await conn.commit();
+      return {
+        success: true,
+        reservationId: rsvId,
+        leaseVersion,
+        leaseExpiresAt,
+        downloadCount: curDownloads,
+        reservedSlots: curReserved + 1,
+        maxDownloads: max_downloads || "unlimited",
+      };
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  // Local JSON fallback
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(sessionId));
+  if (!share) return { success: false, reason: "session_not_found" };
+
+  const curDownloads = Number(share.download_count) || 0;
+  const curReserved = Number(share.reserved_slots) || 0;
+  const maxDl = share.max_downloads;
+
+  if (maxDl && maxDl !== "unlimited" && (curDownloads + curReserved) >= Number(maxDl)) {
+    return {
+      success: false,
+      reason: "limit_reached",
+      downloadCount: curDownloads,
+      reservedSlots: curReserved,
+      maxDownloads: maxDl,
+    };
+  }
+
+  share.reserved_slots = curReserved + 1;
+  saveLocalOnlineShares(shares);
+  return {
+    success: true,
+    reservationId: rsvId,
+    leaseVersion,
+    leaseExpiresAt,
+    downloadCount: curDownloads,
+    reservedSlots: curReserved + 1,
+    maxDownloads: maxDl || "unlimited",
+  };
+}
+
+async function renewOnlineShareLease(sessionId, recipientId, reservationId, currentLeaseVersion) {
+  const newLeaseVersion = (Number(currentLeaseVersion) || 1) + 1;
+  const newLeaseExpiresAt = Date.now() + 45000;
+
+  if (isTiDBConnected && pool) {
+    try {
+      const [res] = await pool.query(
+        `UPDATE online_share_recipients 
+         SET lease_version = ?, 
+             lease_expires_at = ?, 
+             last_seen = NOW() 
+         WHERE session_id = ? AND recipient_id = ? AND reservation_id = ? AND lease_version = ?`,
+        [newLeaseVersion, newLeaseExpiresAt, sessionId, recipientId, reservationId, currentLeaseVersion]
+      );
+      return { success: res.affectedRows > 0, leaseVersion: newLeaseVersion, leaseExpiresAt: newLeaseExpiresAt };
+    } catch (_) {
+      return { success: false };
+    }
+  }
+  return { success: true, leaseVersion: newLeaseVersion, leaseExpiresAt: newLeaseExpiresAt };
+}
+
+async function releaseOnlineShareSlot(sessionId, recipientId, expectedReservationId = null, expectedLeaseVersion = null) {
+  if (isTiDBConnected && pool) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      if (recipientId && expectedLeaseVersion != null) {
+        // Prevent race condition: check if client already renewed lease
+        const [rows] = await conn.query(
+          `SELECT lease_version, reservation_id FROM online_share_recipients WHERE session_id = ? AND recipient_id = ?`,
+          [sessionId, recipientId]
+        );
+        if (rows && rows.length > 0) {
+          const rec = rows[0];
+          if (rec.lease_version > expectedLeaseVersion || (expectedReservationId && rec.reservation_id !== expectedReservationId)) {
+            await conn.rollback();
+            return { success: false, reason: "lease_renewed_by_client" };
+          }
+        }
+      }
+
+      await conn.query(
+        `UPDATE online_shares SET reserved_slots = GREATEST(0, COALESCE(reserved_slots, 0) - 1) WHERE id = ?`,
+        [sessionId]
+      );
+
+      if (recipientId) {
+        await conn.query(
+          `UPDATE online_share_recipients SET status = 'released', last_seen = NOW() WHERE session_id = ? AND recipient_id = ? AND status = 'reserved'`,
+          [sessionId, recipientId]
+        );
+      }
+
+      const [updatedRows] = await conn.query(`SELECT reserved_slots FROM online_shares WHERE id = ?`, [sessionId]);
+      await conn.commit();
+      return { success: true, reservedSlots: updatedRows[0]?.reserved_slots || 0 };
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  // Local fallback
+  const shares = loadLocalOnlineShares();
+  const share = shares.find((s) => Number(s.id) === Number(sessionId));
+  if (share && share.reserved_slots > 0) {
+    share.reserved_slots = Math.max(0, (share.reserved_slots || 0) - 1);
+    saveLocalOnlineShares(shares);
+  }
+  return { success: true, reservedSlots: share ? share.reserved_slots : 0 };
 }
 
 module.exports = {
@@ -1823,4 +2325,13 @@ module.exports = {
   listActiveOnlineSharesByOwner,
   incrementOnlineShareViewCount,
   incrementOnlineShareDownloadCount,
+  registerOnlineShareRecipient,
+  getOnlineShareRecipients,
+  updateOnlineShareRecipient,
+  recordOnlineShareDownloadAtomic,
+  reserveOnlineShareSlot,
+  releaseOnlineShareSlot,
+  renewOnlineShareLease,
+  saveOnlineShareTicket,
+  consumeOnlineShareTicket,
 };

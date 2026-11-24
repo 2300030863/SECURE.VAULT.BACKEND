@@ -200,9 +200,8 @@ async function sendResetEmail(email, resetUrl, otpCode = "") {
               We received a password reset request for <strong>${email}</strong>. Use the 6-digit OTP code below or click the direct verification link to auto-fill your code.
             </p>
 
-            ${
-              otpCode
-                ? `
+            ${otpCode
+        ? `
             <!-- OTP Box -->
             <div style="text-align:center;margin:24px 0;background:#09090b;padding:22px;border-radius:14px;border:1px solid #3f3f46;box-shadow:inset 0 2px 6px rgba(0,0,0,0.5);">
               <p style="margin:0 0 6px;font-size:11px;color:#a1a1aa;text-transform:uppercase;letter-spacing:1.5px;font-weight:600;">Your 6-Digit OTP Verification Code</p>
@@ -212,8 +211,8 @@ async function sendResetEmail(email, resetUrl, otpCode = "") {
               <p style="margin:8px 0 0;font-size:12px;color:#71717a;">Valid for 15 minutes from issue</p>
             </div>
             `
-                : ""
-            }
+        : ""
+      }
 
             <!-- 1-Click Link Button -->
             <div style="text-align:center;margin:28px 0 20px;">
@@ -397,9 +396,8 @@ async function sendVerificationEmail(email, otpCode, verifyUrl = "", expiryMinut
               <p style="margin:8px 0 0;font-size:12px;color:#71717a;">Expires in ${expiryMinutes} minutes</p>
             </div>
 
-            ${
-              verifyUrl
-                ? `
+            ${verifyUrl
+        ? `
             <!-- 1-Click Verification Button -->
             <div style="text-align:center;margin:26px 0 20px;">
               <a href="${verifyUrl}" style="display:inline-block;padding:14px 32px;background:#dc2626;color:#ffffff;text-decoration:none;border-radius:10px;font-weight:700;font-size:15px;letter-spacing:0.3px;box-shadow:0 4px 16px rgba(220,38,38,0.45);">
@@ -420,8 +418,8 @@ async function sendVerificationEmail(email, otpCode, verifyUrl = "", expiryMinut
               </p>
             </div>
             `
-                : ""
-            }
+        : ""
+      }
 
             <!-- Time Sensitive Alert Callout -->
             <div style="background:#1e1a1c;padding:14px 16px;border-radius:10px;border-left:4px solid #ef4444;margin:22px 0 16px;">
@@ -503,9 +501,8 @@ async function sendPinRecoveryOtpEmail(email, otpCode, recoveryUrl = "", expiryM
               <p style="margin:8px 0 0;font-size:12px;color:#71717a;">Expires in ${expiryMinutes} minutes</p>
             </div>
 
-            ${
-              recoveryUrl
-                ? `
+            ${recoveryUrl
+        ? `
             <div style="margin:20px 0 16px;background:#0c0c0e;border:1px solid #27272a;border-radius:10px;padding:14px;">
               <p style="margin:0 0 6px;font-size:12px;font-weight:600;color:#d4d4d8;">
                 🔗 Direct PIN Recovery Link:
@@ -515,8 +512,8 @@ async function sendPinRecoveryOtpEmail(email, otpCode, recoveryUrl = "", expiryM
               </div>
             </div>
             `
-                : ""
-            }
+        : ""
+      }
 
             <div style="background:#1e1a1c;padding:12px 14px;border-radius:8px;border-left:3px solid #ef4444;margin:18px 0;">
               <p style="margin:0;font-size:12px;color:#fecaca;line-height:1.5;">
@@ -549,13 +546,13 @@ async function sendAdminCustomEmail(to, subject, message, options = {}) {
 
   const categoryBadgeColor =
     category === "security" ? "#dc2626" :
-    category === "maintenance" ? "#d97706" :
-    category === "urgent" ? "#b91c1c" : "#e50936";
+      category === "maintenance" ? "#d97706" :
+        category === "urgent" ? "#b91c1c" : "#e50936";
 
   const categoryLabel =
     category === "security" ? "SECURITY ADVISORY" :
-    category === "maintenance" ? "MAINTENANCE NOTICE" :
-    category === "urgent" ? "URGENT SYSTEM UPDATE" : "SYSTEM ANNOUNCEMENT";
+      category === "maintenance" ? "MAINTENANCE NOTICE" :
+        category === "urgent" ? "URGENT SYSTEM UPDATE" : "SYSTEM ANNOUNCEMENT";
 
   const formattedHtmlContent = String(message || "")
     .split(/\n\s*\n/)

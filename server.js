@@ -70,7 +70,8 @@ const {
   generateSummary,
   answerQuestion,
   generateQuiz,
-  getGroqApiKey,
+  getGeminiApiKey,
+  getGeminiStatus,
   textCache,
   summaryCache,
 } = require("./aiService");
@@ -141,22 +142,41 @@ app.use((_req, res, next) => {
   next();
 });
 
-// CORS configuration with explicit Vercel support & credential reflection
-const allowedOrigins = [
-  "https://secure-vault-delta-virid.vercel.app",
+// CORS configuration with dynamic production Vercel & environment support
+const configuredOrigins = [
   process.env.FRONTEND_URL,
   process.env.FRONTEND_ORIGIN,
+  ...(process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(",") : []),
   "http://localhost:5173",
   "http://localhost:3000",
   "http://localhost:5174",
-].filter(Boolean).map(o => o.trim().replace(/\/+$/, ""));
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:3000",
+]
+  .filter(Boolean)
+  .map((o) => o.trim().replace(/\/+$/, ""));
 
 app.use(
   cors({
     origin: function (origin, callback) {
       if (!origin) return callback(null, true);
       const cleanOrigin = origin.trim().replace(/\/+$/, "");
-      if (allowedOrigins.includes(cleanOrigin)) return callback(null, true);
+
+      // 1. Exact match against configured origins
+      if (configuredOrigins.includes(cleanOrigin)) return callback(null, true);
+
+      // 2. Allow Vercel preview or production deployments for this project
+      try {
+        const parsed = new URL(cleanOrigin);
+        if (
+          parsed.hostname.endsWith(".vercel.app") ||
+          parsed.hostname === "localhost" ||
+          parsed.hostname === "127.0.0.1"
+        ) {
+          return callback(null, true);
+        }
+      } catch (_) {}
+
       return callback(null, false);
     },
     credentials: true,
@@ -180,6 +200,19 @@ app.use(firewallMiddleware);
 // Safe JSON & Form Body Parsing with payload limits to prevent ReDoS / memory exhaustion
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
+
+// Security: Redact sensitive credentials (tickets, tokens, codes) from logs and error traces
+app.use((req, _res, next) => {
+  if (req.url && (req.url.includes("ticket=") || req.url.includes("token=") || req.url.includes("accessCode="))) {
+    req.sanitizedUrl = req.url.replace(
+      /([?&](?:ticket|token|ownerToken|recipientToken|accessCode|password)=)[^&]*/gi,
+      "$1[REDACTED]"
+    );
+  } else {
+    req.sanitizedUrl = req.url;
+  }
+  next();
+});
 
 // Public Firewall Defense Status Endpoint
 app.get("/api/firewall/status", (_req, res) => {
@@ -3422,7 +3455,7 @@ app.get("/api/documents/recent", optionalAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// DOCQEVRILO AI ASSISTANT ROUTES (Powered by Groq Cloud & Llama 3.3 70B)
+// DOCQEVRILO AI ASSISTANT ROUTES (Powered by Google Gemini API & @google/genai)
 // ---------------------------------------------------------------------------
 
 // Helper: Authorize document access for AI operations (owner or valid access code)
@@ -3471,47 +3504,47 @@ async function getDocumentExtractedText(doc, refresh = false) {
 
 // AI Status & Configuration Check
 app.get("/api/ai/status", optionalAuth, (req, res) => {
-  const apiKey = getGroqApiKey();
-  res.json({
-    enabled: Boolean(apiKey),
-    provider: "Groq Cloud",
-    model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
-    fallbackModel: "llama-3.1-8b-instant",
-    features: ["summarizer", "ask_ai", "quiz_generator", "vision_ocr", "audio_transcription", "archive_deep_scan"],
-  });
+  res.json(getGeminiStatus());
 });
 
-// Optional: Configure or update GROQ_API_KEY from frontend
+// Optional: Configure or update GEMINI_API_KEY from frontend
 app.post("/api/ai/config", requireAuth, async (req, res) => {
   try {
     const { apiKey } = req.body;
-    if (!apiKey || typeof apiKey !== "string" || !apiKey.trim().startsWith("gsk_")) {
-      return res.status(400).json({ error: "Please enter a valid Groq API Key (starts with gsk_)." });
+    if (!apiKey || typeof apiKey !== "string" || apiKey.trim().length < 10) {
+      return res.status(400).json({ error: "Please enter a valid Google Gemini API Key." });
     }
 
-    process.env.GROQ_API_KEY = apiKey.trim();
+    process.env.GEMINI_API_KEY = apiKey.trim();
     res.json({
       success: true,
-      message: "Groq API Key configured successfully.",
+      message: "Google Gemini API Key configured successfully.",
+      status: getGeminiStatus(),
     });
   } catch (err) {
-    res.status(500).json({ error: err.message || "Failed to configure Groq API Key." });
+    res.status(500).json({ error: err.message || "Failed to configure Google Gemini API Key." });
   }
 });
 
-// 1. AI Document Summarizer
+// 1. AI Document Summarizer with Exact Bullet Count & Complete PDF Coverage
 app.post("/api/ai/documents/:id/summary", optionalAuth, accessLimiter, async (req, res) => {
   try {
     const doc = await resolveDocumentForAi(req.params.id, req);
-    const mode = req.body?.mode || "detailed"; // 'detailed' | 'quick' | 'exam'
+    const mode = req.body?.mode || req.query?.mode || "simple_learning";
+    const bulletCount = parseInt(
+      req.body?.bulletCount || req.body?.bullet_count || req.query?.bullets || req.query?.count || 80,
+      10
+    );
     const refresh = Boolean(req.body?.refresh || req.query?.refresh);
 
     if (refresh) {
-      summaryCache.delete(`${doc.id}_${mode}`);
+      for (const k of summaryCache.keys()) {
+        if (k.startsWith(`${doc.id}_`)) summaryCache.delete(k);
+      }
       textCache.delete(doc.id);
     }
 
-    const { fullText } = await getDocumentExtractedText(doc, refresh);
+    const { fullText, chunks, totalPages } = await getDocumentExtractedText(doc, refresh);
 
     if (!fullText || !fullText.trim()) {
       return res.status(400).json({
@@ -3519,7 +3552,16 @@ app.post("/api/ai/documents/:id/summary", optionalAuth, accessLimiter, async (re
       });
     }
 
-    const summaryResult = await generateSummary(doc.id, fullText, doc.original_name, mode, refresh);
+    const summaryResult = await generateSummary(
+      doc.id,
+      fullText,
+      doc.original_name,
+      { mode, bulletCount, chunks, totalPages },
+      refresh,
+      chunks,
+      totalPages
+    );
+
     res.json({
       success: true,
       documentName: doc.original_name,

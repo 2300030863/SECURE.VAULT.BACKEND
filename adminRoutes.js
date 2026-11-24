@@ -567,47 +567,23 @@ router.get("/audit-logs/export", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Email Communication & Broadcast Routes
+// Email Communication & Broadcast Routes (Powered by Google Gemini API)
 // ---------------------------------------------------------------------------
+
+const { callGemini, getGeminiApiKey } = require("./geminiService");
 
 function getAiConfig(customApiKey) {
   const customKey = (customApiKey || "").trim();
-  const groqKey = (process.env.GROQ_API_KEY || "").trim();
-  const xaiKey = (process.env.XAI_API_KEY || process.env.GROK_API_KEY || process.env.GROK_KEY || "").trim();
+  const geminiKey = (getGeminiApiKey() || "").trim();
 
-  const keyToUse = customKey || groqKey || xaiKey;
+  const keyToUse = customKey || geminiKey;
   if (!keyToUse) return null;
 
-  // If key starts with gsk_ or GROQ_API_KEY is configured, route to Groq Cloud endpoint
-  const isGroq = keyToUse.startsWith("gsk_") || Boolean(groqKey && !customKey && !xaiKey);
-
-  if (isGroq) {
-    return {
-      provider: "groq",
-      name: "Groq AI",
-      apiKey: keyToUse,
-      endpoint: "https://api.groq.com/openai/v1/chat/completions",
-      models: Array.from(new Set([
-        process.env.GROQ_MODEL,
-        "openai/gpt-oss-120b",
-        "openai/gpt-oss-20b",
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "qwen/qwen3.8-27b",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it",
-      ].filter(Boolean))),
-      supportJsonFormat: true,
-    };
-  }
-
   return {
-    provider: "xai",
-    name: "xAI Grok",
+    provider: "gemini",
+    name: "Google Gemini",
     apiKey: keyToUse,
-    endpoint: "https://api.x.ai/v1/chat/completions",
-    models: ["grok-2-latest", "grok-beta"],
-    supportJsonFormat: false,
+    model: process.env.GEMINI_MODEL || "gemini-3.8-flash",
   };
 }
 
@@ -620,7 +596,7 @@ router.get("/email/status", async (_req, res) => {
       configured,
       grokConfigured: Boolean(aiConfig),
       provider: "Brevo Transactional API",
-      aiProvider: aiConfig?.name || "Groq AI",
+      aiProvider: aiConfig?.name || "Google Gemini",
       senderEmail: process.env.BREVO_SENDER_EMAIL || null,
       senderName: process.env.BREVO_SENDER_NAME || "DocQevrilo",
     });
@@ -649,7 +625,7 @@ router.post("/email/generate-ai", async (req, res) => {
 
     if (!aiConfig) {
       return res.status(400).json({
-        error: "GROQ_API_KEY is missing from backend environment.",
+        error: "GEMINI_API_KEY is missing from backend environment.",
         needsKey: true
       });
     }
@@ -749,77 +725,32 @@ Do not simply repeat the instruction.
 `;
 
     let generatedContent = null;
-    let successfulModel = null;
+    let successfulModel = aiConfig.model || "gemini-3.8-flash";
     let lastError = null;
 
-    for (const model of aiConfig.models) {
-      try {
-        const requestBody = {
-          model,
-          messages: [
-            {
-              role: "system",
-              content: systemPrompt
-            },
-            {
-              role: "user",
-              content: userPrompt
-            }
-          ],
-          temperature: 0.65,
-          max_tokens: 1200
-        };
-
-        if (
-          aiConfig.supportJsonFormat &&
-          (model.includes("llama-3") || model.includes("gpt") || model.includes("qwen"))
-        ) {
-          requestBody.response_format = {
-            type: "json_object"
-          };
-        }
-
-        const response = await fetch(aiConfig.endpoint, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${aiConfig.apiKey}`,
-            "Content-Type": "application/json",
-            Accept: "application/json"
-          },
-          body: JSON.stringify(requestBody)
-        });
-
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-          lastError =
-            data.error?.message ||
-            `AI provider returned HTTP ${response.status}`;
-
-          console.warn(`[Email AI] ${model}: ${lastError}`);
-          continue;
-        }
-
-        const content =
-          data.choices?.[0]?.message?.content?.trim();
-
-        if (content) {
-          generatedContent = content;
-          successfulModel = model;
-          break;
-        }
-
-      } catch (error) {
-        lastError = error.message;
-        console.warn(`[Email AI] ${model}:`, error.message);
+    try {
+      if (customApiKey) {
+        process.env.GEMINI_API_KEY = customApiKey.trim();
       }
+
+      generatedContent = await callGemini({
+        contents: [
+          { role: "user", parts: [{ text: userPrompt }] }
+        ],
+        systemInstruction: systemPrompt,
+        temperature: 0.65,
+        maxOutputTokens: 2000,
+        responseMimeType: "application/json",
+      });
+    } catch (err) {
+      lastError = err.message;
+      console.warn("[Email AI Gemini Error]:", err.message);
     }
 
-    // Never pretend that an offline fallback is AI-generated content.
     if (!generatedContent) {
       return res.status(502).json({
         success: false,
-        error: "AI email generation failed. Please check your Groq API key and model availability.",
+        error: "AI email generation failed. Please check your Google Gemini API key and model availability.",
         details: lastError
       });
     }
