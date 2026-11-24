@@ -191,7 +191,37 @@ router.post("/create", async (req, res) => {
     // 1. Identify user (supports authenticated accounts and guest live sharing)
     const ownerId = req.user && req.user.id ? Number(req.user.id) : null;
 
-    const { fileName, fileSize, mimeType, durationMinutes = 60 } = req.body;
+    const {
+      fileName,
+      fileSize,
+      mimeType,
+      durationMinutes = 60,
+      maxDownloads = "unlimited",
+      deleteAfterDownload = false,
+    } = req.body || {};
+
+    // Validate sharing limits before creating the database record.
+    const normalizedMaxDownloads =
+      maxDownloads === "unlimited" || maxDownloads == null || maxDownloads === ""
+        ? "unlimited"
+        : Number(maxDownloads);
+
+    if (
+      normalizedMaxDownloads !== "unlimited" &&
+      (!Number.isInteger(normalizedMaxDownloads) || normalizedMaxDownloads < 1 || normalizedMaxDownloads > 100000)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Maximum downloads must be 'unlimited' or a positive whole number.",
+      });
+    }
+
+    if (typeof deleteAfterDownload !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        error: "deleteAfterDownload must be a boolean value.",
+      });
+    }
 
     // 2. Input validation & sanitization
     if (!fileName || typeof fileName !== "string" || !fileName.trim()) {
@@ -235,8 +265,8 @@ router.post("/create", async (req, res) => {
       file_size: parsedSize,
       mime_type: cleanMime,
       expires_at: expiresAt,
-      max_downloads: maxDownloads,
-      delete_after_download: Boolean(deleteAfterDownload),
+      max_downloads: normalizedMaxDownloads,
+      delete_after_download: deleteAfterDownload,
     });
 
     const sessionId = Number(dbRecord.id);
@@ -250,8 +280,8 @@ router.post("/create", async (req, res) => {
       fileName: cleanFileName,
       fileSize: parsedSize,
       mimeType: cleanMime,
-      maxDownloads: maxDownloads || "unlimited",
-      deleteAfterDownload: Boolean(deleteAfterDownload),
+      maxDownloads: normalizedMaxDownloads,
+      deleteAfterDownload,
       viewCount: 0,
       downloadCount: 0,
       status: "active",
@@ -288,8 +318,18 @@ router.post("/create", async (req, res) => {
       message: "Live sharing session created. Keep this tab open while sharing.",
     });
   } catch (err) {
-    console.error("[Online Share Create Error]", err);
-    return res.status(500).json({ success: false, error: "Failed to initialize sharing session." });
+    console.error("[Online Share Create Error]", {
+      message: err?.message,
+      code: err?.code,
+      sqlMessage: err?.sqlMessage,
+      stack: err?.stack,
+    });
+    return res.status(500).json({
+      success: false,
+      error: "Failed to initialize sharing session.",
+      // Safe diagnostic identifier for matching the response with Render logs.
+      requestId: req.headers["x-request-id"] || null,
+    });
   }
 });
 
