@@ -366,9 +366,12 @@ function initP2PSocketServer(httpServer, { corsOriginCheck, jwtSecret }) {
           Math.max(parseInt(durationSeconds, 10) || 900, MIN_DURATION_SEC),
           MAX_DURATION_SEC
         );
-        const parsedMaxRecipients = ALLOWED_MAX_RECIPIENTS.has(Number(maxRecipients))
-          ? Number(maxRecipients)
-          : 1;
+        const parsedMaxRecipients =
+          maxRecipients === null || maxRecipients === "unlimited" || Number(maxRecipients) === 0
+            ? null
+            : ALLOWED_MAX_RECIPIENTS.has(Number(maxRecipients))
+            ? Number(maxRecipients)
+            : 1;
 
         const createdAt = Date.now();
         const expiresAt = createdAt + parsedDuration * 1000;
@@ -472,7 +475,7 @@ function initP2PSocketServer(httpServer, { corsOriginCheck, jwtSecret }) {
 
         // Check active recipient limits (atomic in single-threaded Node event loop)
         const activeRecipientsCount = session.recipients.size;
-        if (activeRecipientsCount >= session.maxRecipients) {
+        if (session.maxRecipients != null && activeRecipientsCount >= session.maxRecipients) {
           const msg = "Recipient limit reached for this session.";
           socket.emit("p2p:error", { code: "RECIPIENT_LIMIT_REACHED", message: msg });
           return ack?.({ ok: false, error: msg });
