@@ -1,4 +1,5 @@
 const express = require("express");
+const http = require("http");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
@@ -64,6 +65,7 @@ const db = require("./db");
 const authRoutes = require("./authRoutes");
 const adminRoutes = require("./adminRoutes");
 const onlineShareRoutes = require("./onlineShareRoutes");
+const { initP2PSocketServer, getIceServersConfig } = require("./p2pSocketServer");
 const { checkOtpRateLimit, resetOtpRateLimit, getOtpRateLimitStatus } = require("./otpRateLimiter");
 const {
   extractDocumentText,
@@ -156,29 +158,31 @@ const configuredOrigins = [
   .filter(Boolean)
   .map((o) => o.trim().replace(/\/+$/, ""));
 
+const corsOriginCheck = function (origin, callback) {
+  if (!origin) return callback(null, true);
+  const cleanOrigin = origin.trim().replace(/\/+$/, "");
+
+  // 1. Exact match against configured origins
+  if (configuredOrigins.includes(cleanOrigin)) return callback(null, true);
+
+  // 2. Allow Vercel preview or production deployments for this project
+  try {
+    const parsed = new URL(cleanOrigin);
+    if (
+      parsed.hostname.endsWith(".vercel.app") ||
+      parsed.hostname === "localhost" ||
+      parsed.hostname === "127.0.0.1"
+    ) {
+      return callback(null, true);
+    }
+  } catch (_) {}
+
+  return callback(null, false);
+};
+
 app.use(
   cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-      const cleanOrigin = origin.trim().replace(/\/+$/, "");
-
-      // 1. Exact match against configured origins
-      if (configuredOrigins.includes(cleanOrigin)) return callback(null, true);
-
-      // 2. Allow Vercel preview or production deployments for this project
-      try {
-        const parsed = new URL(cleanOrigin);
-        if (
-          parsed.hostname.endsWith(".vercel.app") ||
-          parsed.hostname === "localhost" ||
-          parsed.hostname === "127.0.0.1"
-        ) {
-          return callback(null, true);
-        }
-      } catch (_) {}
-
-      return callback(null, false);
-    },
+    origin: corsOriginCheck,
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
     allowedHeaders: [
@@ -535,6 +539,11 @@ app.get("/api/announcement", (_req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes.router);
 app.use("/api/online-share", optionalAuth, onlineShareRoutes);
+
+// Ephemeral P2P ICE/STUN/TURN discovery endpoint (no secrets exposed)
+app.get("/api/p2p/ice-servers", optionalAuth, (_req, res) => {
+  res.json({ success: true, iceServers: getIceServersConfig() });
+});
 
 function createOtpCode() {
   return crypto.randomInt(100000, 1000000).toString();
@@ -3672,8 +3681,14 @@ async function startServer() {
     }
   }, 30 * 1000);
 
-  app.listen(PORT, HOST, () => {
-    console.log(`[Secure Vault Backend] Running on http://${HOST}:${PORT}`);
+  const httpServer = http.createServer(app);
+  initP2PSocketServer(httpServer, {
+    corsOriginCheck,
+    jwtSecret: effectiveJwtSecret,
+  });
+
+  httpServer.listen(PORT, HOST, () => {
+    console.log(`[Secure Vault Backend] Running on http://${HOST}:${PORT} (Socket.IO P2P Signaling Active)`);
   });
 }
 
