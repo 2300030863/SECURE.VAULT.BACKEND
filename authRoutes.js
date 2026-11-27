@@ -131,9 +131,7 @@ router.post("/forgot-password", forgotLimiter, async (req, res) => {
     resetUrl.searchParams.set("otp", otpCode);
     resetUrl.searchParams.set("exp", String(expiresTimestamp));
 
-    console.log(`\n======================================================`);
-    console.log(`🔑 [FORGOT PASSWORD OTP] Code for ${user.email}: [ ${otpCode} ] (Expires in 15m)`);
-    console.log(`======================================================\n`);
+    console.log(`[Forgot Password OTP] Reset OTP dispatched for ${user.email} (Expires in 15m)`);
 
     let mailResult;
     let emailSent = false;

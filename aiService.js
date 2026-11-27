@@ -11,10 +11,7 @@
 const pdfParse = require("pdf-parse");
 const AdmZip = require("adm-zip");
 const mammoth = require("mammoth");
-let XLSX = null;
-try {
-  XLSX = require("xlsx");
-} catch (_) {}
+const { extractSpreadsheetText } = require("./spreadsheetHelper");
 require("dotenv").config();
 
 const {
@@ -280,43 +277,13 @@ async function extractPptxText(pptxBuffer, filename = "presentation.pptx") {
  * @param {Buffer} buffer - Excel file buffer
  * @param {string} filename - Filename for display and metadata
  */
-function extractExcelText(buffer, filename = "spreadsheet.xlsx") {
+async function extractExcelText(buffer, filename = "spreadsheet.xlsx") {
   if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) {
     return { fullText: "", chunks: [] };
   }
 
   try {
-    if (!XLSX) {
-      XLSX = require("xlsx");
-    }
-    const workbook = XLSX.read(buffer, { type: "buffer" });
-    const chunks = [];
-    let fullText = "";
-
-    workbook.SheetNames.forEach((sheetName, idx) => {
-      const sheet = workbook.Sheets[sheetName];
-      const csv = XLSX.utils.sheet_to_csv(sheet);
-      if (csv && csv.trim()) {
-        const sheetText = `### Sheet: ${sheetName}\n${csv.trim()}`;
-        fullText += (fullText ? "\n\n" : "") + sheetText;
-        chunks.push({
-          pageNum: idx + 1,
-          label: `${filename} - Sheet: ${sheetName}`,
-          text: sheetText,
-        });
-      }
-    });
-
-    if (!fullText.trim()) {
-      fullText = `[Spreadsheet: ${filename}]\nContains worksheets with no tabular rows.`;
-      chunks.push({
-        pageNum: 1,
-        label: `${filename} (Spreadsheet)`,
-        text: fullText,
-      });
-    }
-
-    return { fullText: fullText.trim(), chunks };
+    return await extractSpreadsheetText(buffer, filename);
   } catch (err) {
     console.warn(`[Excel Extraction Warning for ${filename}]:`, err.message);
     const fallbackText = `[Spreadsheet Document: ${filename}]\nFile Size: ${(buffer.length / 1024).toFixed(1)} KB\nNote: Excel data workbook stored in DocQevrilo Vault.`;
@@ -417,7 +384,7 @@ async function extractDocumentText(buffer, originalName = "", mimeType = "") {
           chunks.push(...pptxRes.chunks);
           fullText += `\n\n--- File: ${cleanName} ---\n${pptxRes.fullText}`;
         } else if (entryLower.endsWith(".xlsx") || entryLower.endsWith(".xls")) {
-          const xlsRes = extractExcelText(entryData, cleanName);
+          const xlsRes = await extractExcelText(entryData, cleanName);
           chunks.push(...xlsRes.chunks);
           fullText += `\n\n--- Spreadsheet: ${cleanName} ---\n${xlsRes.fullText}`;
         } else if (
@@ -544,7 +511,7 @@ async function extractDocumentText(buffer, originalName = "", mimeType = "") {
       mimeType.includes("spreadsheet") ||
       mimeType.includes("excel")
     ) {
-      const xlsRes = extractExcelText(buffer, originalName);
+      const xlsRes = await extractExcelText(buffer, originalName);
       fullText = xlsRes.fullText;
       chunks.push(...xlsRes.chunks);
     } else if (

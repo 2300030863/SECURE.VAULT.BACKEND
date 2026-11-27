@@ -14,6 +14,7 @@ const LOCAL_USERS_FILE = path.join(__dirname, "local_users.json");
 const LOCAL_AUDIT_FILE = path.join(__dirname, "local_audit_logs.json");
 const LOCAL_OTP_LIMITS_FILE = path.join(__dirname, "local_otp_rate_limits.json");
 const LOCAL_ONLINE_SHARES_FILE = path.join(__dirname, "local_online_shares.json");
+const LOCAL_SESSIONS_FILE = path.join(__dirname, "local_sessions.json");
 
 // ---------------------------------------------------------------------------
 // Local JSON Fallback Helpers (Development Only)
@@ -231,6 +232,7 @@ async function initDatabase() {
       await safeAddColumn(pool, "users", "email_verified", "TINYINT(1) NOT NULL DEFAULT 1");
       await safeAddColumn(pool, "users", "role", "VARCHAR(20) NOT NULL DEFAULT 'user'");
       await safeAddColumn(pool, "users", "status", "VARCHAR(20) NOT NULL DEFAULT 'active'");
+      await safeAddColumn(pool, "users", "token_version", "INT NOT NULL DEFAULT 1");
       await pool.query(`CREATE TABLE IF NOT EXISTS admin_audit_logs (
         id BIGINT AUTO_INCREMENT PRIMARY KEY,
         admin_id BIGINT NOT NULL,
@@ -417,6 +419,31 @@ async function initDatabase() {
           expires_at BIGINT NOT NULL,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           INDEX idx_ost_expires (expires_at)
+        );
+      `);
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS revoked_jtis (
+          jti VARCHAR(128) PRIMARY KEY,
+          expires_at BIGINT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_rj_expires (expires_at)
+        );
+      `);
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+          token_hash CHAR(64) PRIMARY KEY,
+          user_id BIGINT NOT NULL,
+          family_id VARCHAR(64) NOT NULL,
+          token_version INT NOT NULL DEFAULT 1,
+          expires_at BIGINT NOT NULL,
+          used TINYINT(1) NOT NULL DEFAULT 0,
+          revoked TINYINT(1) NOT NULL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_rt_user (user_id),
+          INDEX idx_rt_family (family_id),
+          INDEX idx_rt_expires (expires_at)
         );
       `);
 
@@ -1290,7 +1317,10 @@ async function updateUserRole(id, role) {
 
 async function updateUserPassword(id, passwordHash) {
   if (isTiDBConnected && pool) {
-    const [result] = await pool.query(`UPDATE users SET password_hash = ? WHERE id = ?`, [passwordHash, id]);
+    const [result] = await pool.query(
+      `UPDATE users SET password_hash = ?, token_version = COALESCE(token_version, 1) + 1 WHERE id = ?`,
+      [passwordHash, id]
+    );
     return result.affectedRows > 0;
   } else {
     let users = loadLocalUsers();
@@ -1298,7 +1328,7 @@ async function updateUserPassword(id, passwordHash) {
     users = users.map((u) => {
       if (Number(u.id) === Number(id)) {
         updated = true;
-        return { ...u, password_hash: passwordHash };
+        return { ...u, password_hash: passwordHash, token_version: (Number(u.token_version) || 1) + 1 };
       }
       return u;
     });
@@ -2272,7 +2302,236 @@ async function releaseOnlineShareSlot(sessionId, recipientId, expectedReservatio
   return { success: true, reservedSlots: share ? share.reserved_slots : 0 };
 }
 
+// ---------------------------------------------------------------------------
+// Persistent Session Revocation & Refresh Token Store (TiDB + Local JSON)
+// ---------------------------------------------------------------------------
+function loadLocalSessions() {
+  try {
+    if (fs.existsSync(LOCAL_SESSIONS_FILE)) {
+      return JSON.parse(fs.readFileSync(LOCAL_SESSIONS_FILE, "utf8"));
+    }
+  } catch (_) {}
+  return { revokedJtis: {}, refreshTokens: {} };
+}
+
+function saveLocalSessions(data) {
+  try {
+    fs.writeFileSync(LOCAL_SESSIONS_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch (err) {
+    console.error("[Local Session Store] Error writing file:", err.message);
+  }
+}
+
+async function saveRevokedJti(jti, expiresAtMs) {
+  if (!jti) return;
+  const exp = Number(expiresAtMs) || Date.now() + 24 * 60 * 60 * 1000;
+  if (isTiDBConnected && pool) {
+    await pool.query(
+      `INSERT INTO revoked_jtis (jti, expires_at) VALUES (?, ?) ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)`,
+      [String(jti), exp]
+    );
+    return;
+  }
+  const store = loadLocalSessions();
+  store.revokedJtis[String(jti)] = exp;
+  saveLocalSessions(store);
+}
+
+async function checkJtiRevoked(jti) {
+  if (!jti) return false;
+  const now = Date.now();
+  if (isTiDBConnected && pool) {
+    const [rows] = await pool.query(
+      `SELECT expires_at FROM revoked_jtis WHERE jti = ? LIMIT 1`,
+      [String(jti)]
+    );
+    if (!rows || rows.length === 0) return false;
+    return Number(rows[0].expires_at) > now;
+  }
+  const store = loadLocalSessions();
+  const exp = store.revokedJtis[String(jti)];
+  if (!exp) return false;
+  if (now > exp) {
+    delete store.revokedJtis[String(jti)];
+    saveLocalSessions(store);
+    return false;
+  }
+  return true;
+}
+
+async function insertRefreshToken({ tokenHash, userId, familyId, tokenVersion, expiresAt }) {
+  if (isTiDBConnected && pool) {
+    await pool.query(
+      `INSERT INTO refresh_tokens (token_hash, user_id, family_id, token_version, expires_at, used, revoked)
+       VALUES (?, ?, ?, ?, ?, 0, 0)`,
+      [tokenHash, Number(userId), familyId, Number(tokenVersion) || 1, Number(expiresAt)]
+    );
+    return;
+  }
+  const store = loadLocalSessions();
+  store.refreshTokens[tokenHash] = {
+    userId: Number(userId),
+    familyId,
+    tokenVersion: Number(tokenVersion) || 1,
+    expiresAt: Number(expiresAt),
+    used: false,
+    revoked: false,
+  };
+  saveLocalSessions(store);
+}
+
+async function revokeRefreshFamilyDb(familyId) {
+  if (!familyId) return;
+  if (isTiDBConnected && pool) {
+    await pool.query(`UPDATE refresh_tokens SET revoked = 1 WHERE family_id = ?`, [familyId]);
+    return;
+  }
+  const store = loadLocalSessions();
+  for (const r of Object.values(store.refreshTokens)) {
+    if (r.familyId === familyId) r.revoked = true;
+  }
+  saveLocalSessions(store);
+}
+
+async function revokeUserRefreshTokensDb(userId) {
+  const uid = Number(userId);
+  if (!uid) return;
+  if (isTiDBConnected && pool) {
+    await pool.query(`UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?`, [uid]);
+    return;
+  }
+  const store = loadLocalSessions();
+  for (const r of Object.values(store.refreshTokens)) {
+    if (Number(r.userId) === uid) r.revoked = true;
+  }
+  saveLocalSessions(store);
+}
+
+async function consumeAndRotateRefreshToken(oldHash, nextRecord) {
+  const now = Date.now();
+  if (isTiDBConnected && pool) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [upd] = await conn.query(
+        `UPDATE refresh_tokens SET used = 1
+         WHERE token_hash = ? AND used = 0 AND revoked = 0 AND expires_at > ?`,
+        [oldHash, now]
+      );
+      if (upd.affectedRows === 0) {
+        const [rows] = await conn.query(
+          `SELECT user_id, family_id, used, revoked, expires_at FROM refresh_tokens WHERE token_hash = ? LIMIT 1`,
+          [oldHash]
+        );
+        if (!rows || rows.length === 0) {
+          await conn.rollback();
+          return { valid: false, reason: "unknown_token" };
+        }
+        const existing = rows[0];
+        if (existing.used) {
+          await conn.query(`UPDATE refresh_tokens SET revoked = 1 WHERE family_id = ?`, [existing.family_id]);
+          await conn.commit();
+          return { valid: false, reason: "token_replay_detected", userId: existing.user_id, familyId: existing.family_id };
+        }
+        await conn.rollback();
+        return { valid: false, reason: "expired_or_revoked" };
+      }
+
+      const [existingRows] = await conn.query(
+        `SELECT user_id, family_id, token_version FROM refresh_tokens WHERE token_hash = ? LIMIT 1`,
+        [oldHash]
+      );
+      const oldRec = existingRows[0];
+      await conn.query(
+        `INSERT INTO refresh_tokens (token_hash, user_id, family_id, token_version, expires_at, used, revoked)
+         VALUES (?, ?, ?, ?, ?, 0, 0)`,
+        [
+          nextRecord.tokenHash,
+          Number(oldRec.user_id),
+          oldRec.family_id,
+          Number(oldRec.token_version) || 1,
+          Number(nextRecord.expiresAt),
+        ]
+      );
+      await conn.commit();
+      return {
+        valid: true,
+        userId: Number(oldRec.user_id),
+        familyId: oldRec.family_id,
+        tokenVersion: Number(oldRec.token_version) || 1,
+      };
+    } catch (err) {
+      try { await conn.rollback(); } catch (_) {}
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  // Local JSON atomic fallback
+  const store = loadLocalSessions();
+  const record = store.refreshTokens[oldHash];
+  if (!record) return { valid: false, reason: "unknown_token" };
+  if (record.revoked || now > record.expiresAt) return { valid: false, reason: "expired_or_revoked" };
+  if (record.used) {
+    for (const r of Object.values(store.refreshTokens)) {
+      if (r.familyId === record.familyId) r.revoked = true;
+    }
+    saveLocalSessions(store);
+    return { valid: false, reason: "token_replay_detected", userId: record.userId, familyId: record.familyId };
+  }
+  record.used = true;
+  store.refreshTokens[nextRecord.tokenHash] = {
+    userId: Number(record.userId),
+    familyId: record.familyId,
+    tokenVersion: Number(record.tokenVersion) || 1,
+    expiresAt: Number(nextRecord.expiresAt),
+    used: false,
+    revoked: false,
+  };
+  saveLocalSessions(store);
+  return {
+    valid: true,
+    userId: Number(record.userId),
+    familyId: record.familyId,
+    tokenVersion: Number(record.tokenVersion) || 1,
+  };
+}
+
+async function getSessionDbMetrics() {
+  const now = Date.now();
+  if (isTiDBConnected && pool) {
+    const [[rj]] = await pool.query(`SELECT COUNT(*) AS cnt FROM revoked_jtis WHERE expires_at > ?`, [now]);
+    const [[rt]] = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM refresh_tokens WHERE used = 0 AND revoked = 0 AND expires_at > ?`,
+      [now]
+    );
+    return {
+      persistentBackend: "tidb_cloud",
+      revokedJtisCount: Number(rj?.cnt || 0),
+      activeRefreshTokensCount: Number(rt?.cnt || 0),
+    };
+  }
+  const store = loadLocalSessions();
+  const revokedJtisCount = Object.values(store.revokedJtis).filter((exp) => exp > now).length;
+  const activeRefreshTokensCount = Object.values(store.refreshTokens).filter(
+    (r) => !r.revoked && !r.used && r.expiresAt > now
+  ).length;
+  return {
+    persistentBackend: "local_sessions_json",
+    revokedJtisCount,
+    activeRefreshTokensCount,
+  };
+}
+
 module.exports = {
+  saveRevokedJti,
+  checkJtiRevoked,
+  insertRefreshToken,
+  consumeAndRotateRefreshToken,
+  revokeRefreshFamilyDb,
+  revokeUserRefreshTokensDb,
+  getSessionDbMetrics,
   initDatabase,
   getPool,
   execute,

@@ -13,7 +13,7 @@ const jwt = require("jsonwebtoken");
 const archiverPkg = require("archiver");
 const AdmZip = require("adm-zip");
 const mammoth = require("mammoth");
-const XLSX = require("xlsx");
+const { renderSpreadsheetHtmlTable } = require("./spreadsheetHelper");
 function createZipArchive(options = { zlib: { level: 0 } }) {
   if (typeof archiverPkg === "function") {
     return archiverPkg("zip", options);
@@ -67,6 +67,16 @@ const adminRoutes = require("./adminRoutes");
 const onlineShareRoutes = require("./onlineShareRoutes");
 const { initP2PSocketServer, getIceServersConfig } = require("./p2pSocketServer");
 const { checkOtpRateLimit, resetOtpRateLimit, getOtpRateLimitStatus } = require("./otpRateLimiter");
+const { encryptBuffer, decryptBuffer } = require("./cryptoAtRest");
+const { scanFileForMalware, scanBufferForMalware } = require("./securityScanner");
+const {
+  revokeJti,
+  isJtiRevoked,
+  issueRefreshToken,
+  rotateRefreshToken,
+  revokeUserRefreshTokens,
+  recordSessionEvent,
+} = require("./sessionManager");
 const {
   extractDocumentText,
   generateSummary,
@@ -206,8 +216,11 @@ app.use(firewallMiddleware);
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
-// Security: Redact sensitive credentials (tickets, tokens, codes) from logs and error traces
-app.use((req, _res, next) => {
+// Request ID tracking & security credential redaction
+app.use((req, res, next) => {
+  const reqId = req.headers["x-request-id"] || crypto.randomUUID();
+  req.requestId = String(reqId).slice(0, 64);
+  res.setHeader("X-Request-Id", req.requestId);
   if (req.url && (req.url.includes("ticket=") || req.url.includes("token=") || req.url.includes("accessCode="))) {
     req.sanitizedUrl = req.url.replace(
       /([?&](?:ticket|token|ownerToken|recipientToken|accessCode|password)=)[^&]*/gi,
@@ -353,7 +366,7 @@ function generateDocAccessTicket(userId, docId) {
 }
 
 // Verifies whether request has access to the owner's document via session JWT or scoped doc ticket
-function verifyOwnerDocAccess(req, doc) {
+async function verifyOwnerDocAccess(req, doc) {
   if (!doc) return false;
   // 1. Authenticated session token from Authorization: Bearer <token>
   if (req.user && Number(req.user.id) === Number(doc.owner_id)) {
@@ -364,6 +377,9 @@ function verifyOwnerDocAccess(req, doc) {
   if (ticketParam) {
     try {
       const decoded = jwt.verify(ticketParam, effectiveJwtSecret);
+      if (decoded.jti && (await isJtiRevoked(decoded.jti))) {
+        return false;
+      }
       // Valid scoped document ticket
       if (
         decoded.purpose === "doc_access" &&
@@ -407,13 +423,28 @@ const requireAuth = async (req, res, next) => {
   }
   try {
     const decoded = jwt.verify(token, effectiveJwtSecret);
+    if (decoded.jti && (await isJtiRevoked(decoded.jti))) {
+      return res.status(401).json({
+        error: "This session has been revoked. Please sign in again.",
+        requireAuth: true
+      });
+    }
     const account = await findUserById(decoded.id);
     if (!account || (account.status && account.status !== "active")) {
       return res.status(403).json({ error: "This account is suspended or no longer active." });
     }
+    const accountTokenVersion = Number(account.token_version || 1);
+    const tokenVersion = Number(decoded.tokenVersion || 1);
+    if (tokenVersion !== accountTokenVersion) {
+      return res.status(401).json({
+        error: "Session invalidated due to security/password update. Please sign in again.",
+        requireAuth: true
+      });
+    }
     req.user = {
       ...decoded,
       role: account.role || "user",
+      tokenVersion: accountTokenVersion,
     };
     next();
   } catch (err) {
@@ -597,7 +628,7 @@ async function issueAccountOtp(user, purpose, sendEmail, req = null) {
   }
 
   console.log(`\n======================================================`);
-  console.log(`🔑 [ACCOUNT OTP] Code for ${user.email} (${purpose}): [ ${otpCode} ] (Expires in 10m)`);
+  console.log(`[ACCOUNT OTP] Verification OTP dispatched for ${user.email} (${purpose}) (Expires in 10m)`);
   console.log(`======================================================\n`);
 
   const frontendUrl = getFrontendUrl(req);
@@ -763,7 +794,7 @@ app.post("/api/auth/send-email-otp", async (req, res) => {
     verifyUrl.searchParams.set("exp", String(expiresTimestamp));
 
     console.log(`\n======================================================`);
-    console.log(`🔑 [INLINE REGISTRATION OTP] Code for ${email}: [ ${otpCode} ] (Expires in 10m)`);
+    console.log(`[INLINE REGISTRATION OTP] Verification OTP dispatched for ${email} (Expires in 10m)`);
     console.log(`🔗 [VERIFY LINK] ${verifyUrl.toString()}`);
     console.log(`======================================================\n`);
 
@@ -929,15 +960,25 @@ app.post("/api/auth/register", async (req, res) => {
     await markUserEmailVerified(userRecord.id);
 
     const token = jwt.sign(
-      { id: userRecord.id, email: userRecord.email, name: userRecord.full_name },
+      {
+        id: userRecord.id,
+        email: userRecord.email,
+        name: userRecord.full_name,
+        role: "user",
+        tokenType: "user",
+        tokenVersion: Number(userRecord.token_version || 1),
+        jti: crypto.randomUUID(),
+      },
       effectiveJwtSecret,
       { expiresIn: "7d" }
     );
+    const refreshIssued = await issueRefreshToken(userRecord.id, Number(userRecord.token_version || 1));
 
     res.status(201).json({
       success: true,
       message: "Account created and email verified! Welcome to your vault.",
       token,
+      refreshToken: refreshIssued.refreshToken,
       requiresEmailVerification: false,
       user: {
         id: userRecord.id,
@@ -980,10 +1021,12 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
+      recordSessionEvent("FAILED_LOGIN", { email: user.email, ip: req.ip });
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
     const userRole = user.role || "user";
+    const tokenVersion = Number(user.token_version || 1);
     const token = jwt.sign(
       {
         id: user.id,
@@ -991,10 +1034,13 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
         name: user.full_name,
         role: userRole,
         tokenType: userRole === "admin" ? "admin" : "user",
+        tokenVersion,
+        jti: crypto.randomUUID(),
       },
       effectiveJwtSecret,
       { expiresIn: "7d" }
     );
+    const refreshIssued = await issueRefreshToken(user.id, tokenVersion);
 
     if (userRole === "admin" && typeof db.recordAuditLog === "function") {
       try {
@@ -1005,6 +1051,7 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
     res.json({
       success: true,
       token,
+      refreshToken: refreshIssued.refreshToken,
       user: {
         id: user.id,
         name: user.full_name,
@@ -1185,9 +1232,61 @@ app.post("/api/auth/request-pin-recovery", requireAuth, accessLimiter, async (re
   }
 });
 
-// 5. Logout
-app.post("/api/auth/logout", (req, res) => {
-  res.json({ success: true, message: "Logged out successfully." });
+// 5. Refresh Token Rotation (Layer 5)
+app.post("/api/auth/refresh", accessLimiter, async (req, res) => {
+  try {
+    const rawRefresh = req.body && req.body.refreshToken;
+    const rotated = await rotateRefreshToken(rawRefresh);
+    if (!rotated.valid) {
+      return res.status(401).json({ error: "Invalid or expired refresh token." });
+    }
+
+    const account = await findUserById(rotated.userId);
+    if (!account || (account.status && account.status !== "active")) {
+      return res.status(403).json({ error: "Account is suspended or unavailable." });
+    }
+    const accountTokenVersion = Number(account.token_version || 1);
+    if (Number(rotated.tokenVersion) !== accountTokenVersion) {
+      return res.status(401).json({ error: "Session invalidated due to password change." });
+    }
+
+    const userRole = account.role || "user";
+    const accessToken = jwt.sign(
+      {
+        id: account.id,
+        email: account.email,
+        name: account.full_name,
+        role: userRole,
+        tokenType: userRole === "admin" ? "admin" : "user",
+        tokenVersion: accountTokenVersion,
+        jti: crypto.randomUUID(),
+      },
+      effectiveJwtSecret,
+      { expiresIn: "7d" }
+    );
+
+    res.json({
+      success: true,
+      token: accessToken,
+      refreshToken: rotated.refreshToken,
+    });
+  } catch (err) {
+    console.error("[Auth Refresh Error]", err.message);
+    res.status(500).json({ error: "Unable to refresh session." });
+  }
+});
+
+// 6. Logout (revokes active JWT jti and refresh tokens)
+app.post("/api/auth/logout", async (req, res) => {
+  const token = extractToken(req);
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, effectiveJwtSecret);
+      if (decoded.jti) await revokeJti(decoded.jti, decoded.exp);
+      if (decoded.id) await revokeUserRefreshTokens(decoded.id);
+    } catch (_) {}
+  }
+  res.json({ success: true, message: "Logged out and session revoked successfully." });
 });
 
 // --- DOCUMENT OPERATIONS ---
@@ -1230,6 +1329,18 @@ app.post("/api/documents/upload", uploadLimiter, requireAuth, handleUploadOrText
     const customName = (req.body.name || req.body.title || req.body.document_name || "").trim();
 
     if (files.length > 0) {
+      for (const file of files) {
+        const scan = scanFileForMalware(file.path, file.originalname);
+        if (!scan.safe) {
+          recordSessionEvent("MALWARE_UPLOAD_BLOCKED", {
+            userId: req.user?.id || null,
+            fileName: file.originalname,
+            threat: scan.threat,
+            ip: req.ip,
+          });
+          return res.status(422).json({ error: scan.reason || "Uploaded file failed security scan." });
+        }
+      }
       fileCount = files.length;
       files.forEach((file, index) => {
         archive.file(file.path, {
@@ -1267,25 +1378,29 @@ app.post("/api/documents/upload", uploadLimiter, requireAuth, handleUploadOrText
     const documentId = crypto.randomUUID();
     storageKey = `archives/${documentId}.zip`;
 
-    // Save copy in local uploads directory as reliable disk fallback
+    // Layer 6: Encrypt ZIP archive with AES-256-GCM (unique 96-bit nonce + AAD) before saving to disk & B2
+    const plainZipBuffer = fs.readFileSync(zipPath);
+    const encryptedZipBuffer = encryptBuffer(plainZipBuffer, storageKey);
+
+    // Save encrypted copy in local uploads directory as reliable disk fallback
     const localArchivePath = path.join(UPLOADS_DIR, storageKey);
     const localArchiveDir = path.dirname(localArchivePath);
     if (!fs.existsSync(localArchiveDir)) {
       fs.mkdirSync(localArchiveDir, { recursive: true });
     }
-    fs.copyFileSync(zipPath, localArchivePath);
+    fs.writeFileSync(localArchivePath, encryptedZipBuffer);
 
-    // Upload ZIP to private Backblaze B2
+    // Upload encrypted ZIP to private Backblaze B2
     if (isB2Configured()) {
       try {
         await uploadToB2({
           key: storageKey,
-          body: fs.createReadStream(zipPath),
-          contentType: "application/zip",
-          contentLength: zipStats.size,
+          body: encryptedZipBuffer,
+          contentType: "application/octet-stream",
+          contentLength: encryptedZipBuffer.length,
         });
         uploadedToB2 = true;
-        console.log(`[Backblaze B2] Stored ZIP archive '${storageKey}' (${zipStats.size} bytes)`);
+        console.log(`[Backblaze B2] Stored AES-256-GCM encrypted archive '${storageKey}' (${encryptedZipBuffer.length} bytes)`);
       } catch (b2Err) {
         console.warn("[Backblaze B2 ZIP Upload Warning]", b2Err.message);
       }
@@ -1431,19 +1546,25 @@ app.post("/api/documents/text", uploadLimiter, requireAuth, async (req, res) => 
 
     const randomKey = crypto.randomBytes(20).toString("hex") + ".txt";
     const filePath = path.join(UPLOADS_DIR, randomKey);
-    fs.writeFileSync(filePath, text, "utf8");
+    const plainTextBuf = Buffer.from(text, "utf8");
+    const textScan = scanBufferForMalware(plainTextBuf, originalName);
+    if (!textScan.safe) {
+      return res.status(422).json({ error: textScan.reason || "Secret text failed security scan." });
+    }
+    const encryptedTextBuf = encryptBuffer(plainTextBuf, randomKey);
+    fs.writeFileSync(filePath, encryptedTextBuf);
 
     let uploadedToB2 = false;
     if (isB2Configured()) {
       try {
         await uploadToB2({
           key: randomKey,
-          body: Buffer.from(text, "utf8"),
-          contentType: mimeType,
-          contentLength: fileSize,
+          body: encryptedTextBuf,
+          contentType: "application/octet-stream",
+          contentLength: encryptedTextBuf.length,
         });
         uploadedToB2 = true;
-        console.log(`[Backblaze B2] Stored secret note as '${randomKey}'`);
+        console.log(`[Backblaze B2] Stored AES-256-GCM encrypted secret note as '${randomKey}'`);
       } catch (b2Err) {
         console.warn("[Backblaze B2 Text Warning]", b2Err.message);
       }
@@ -2115,15 +2236,12 @@ async function sendFileToViewer(cleanName, data, downloadUrl, res) {
   // 2. Spreadsheets (.xlsx, .xls)
   if ([".xlsx", ".xls"].includes(ext)) {
     try {
-      const workbook = XLSX.read(data, { type: "buffer" });
-      const firstSheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[firstSheetName];
-      const tableHtml = XLSX.utils.sheet_to_html(sheet);
+      const tableHtml = await renderSpreadsheetHtmlTable(data);
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.setHeader("X-Content-Type-Options", "nosniff");
       return res.send(renderSheetViewerHtml({ filename: cleanName, sheetHtml: tableHtml, downloadUrl }));
     } catch (sheetErr) {
-      console.warn("[XLSX Convert Warning]", sheetErr.message);
+      console.warn("[Spreadsheet Convert Warning]", sheetErr.message);
     }
   }
 
@@ -2433,11 +2551,12 @@ function renderArchiveViewerHtml(doc, entries, codeParam, req = null) {
 </html>`;
 }
 
-// Fetch document buffer from disk or Backblaze B2
+// Fetch document buffer from disk or Backblaze B2 and decrypt AES-256-GCM envelope
 async function getDocumentBuffer(storageKey) {
   const filePath = path.join(UPLOADS_DIR, storageKey);
   if (fs.existsSync(filePath)) {
-    return fs.readFileSync(filePath);
+    const raw = fs.readFileSync(filePath);
+    return decryptBuffer(raw, storageKey);
   }
   if (isB2Configured()) {
     try {
@@ -2447,7 +2566,8 @@ async function getDocumentBuffer(storageKey) {
         for await (const chunk of b2Object.Body) {
           chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
         }
-        return Buffer.concat(chunks);
+        const raw = Buffer.concat(chunks);
+        return decryptBuffer(raw, storageKey);
       }
     } catch (b2Err) {
       console.warn("[Backblaze B2 Read Warning]", b2Err.message);
@@ -2908,7 +3028,7 @@ app.get("/api/documents/owner/:id/view", optionalAuth, async (req, res) => {
     if (!doc) {
       return res.status(404).json({ error: "Document not found." });
     }
-    if (!verifyOwnerDocAccess(req, doc)) {
+    if (!(await verifyOwnerDocAccess(req, doc))) {
       return res.status(403).json({ error: "Unauthorized access to document." });
     }
     req.query.action = "view";
@@ -2929,7 +3049,7 @@ app.get("/api/documents/owner/:id/download", optionalAuth, async (req, res) => {
     if (!doc) {
       return res.status(404).json({ error: "Document not found." });
     }
-    if (!verifyOwnerDocAccess(req, doc)) {
+    if (!(await verifyOwnerDocAccess(req, doc))) {
       return res.status(403).json({ error: "Unauthorized access to document." });
     }
     req.query.action = "download";
@@ -3148,7 +3268,7 @@ app.post("/api/documents/request-code-otp", requireAuth, accessLimiter, async (r
     });
 
     console.log(`\n======================================================`);
-    console.log(`🔑 [DOCUMENT 2FA OTP] Code for ${req.user.email} (${action || 'reveal'}): [ ${otpCode} ]`);
+    console.log(`[DOCUMENT 2FA OTP] Security OTP dispatched for ${req.user.email} (${action || 'reveal'})`);
     console.log(`======================================================\n`);
 
     try {
@@ -3661,6 +3781,17 @@ app.use((req, res) => {
   res.status(404).json({
     success: false,
     message: `Route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+// Centralized error handler (never leaks internal stack traces)
+app.use((err, req, res, _next) => {
+  console.error(`[Server Error][${req.requestId || "no-id"}]`, err.message);
+  const status = err.status && Number.isInteger(err.status) ? err.status : 500;
+  res.status(status).json({
+    success: false,
+    error: status >= 500 ? "An internal server error occurred." : err.message || "Request failed.",
+    requestId: req.requestId,
   });
 });
 

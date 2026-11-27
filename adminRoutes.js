@@ -34,7 +34,7 @@ if (!rawJwtSecret || rawJwtSecret.length < 32) {
   }
   console.warn("[Admin Security Warning] Set a unique JWT_SECRET (32+ characters) before deployment.");
 }
-const JWT_SECRET = rawJwtSecret || "default_jwt_secret_dev_32characters_min!";
+const JWT_SECRET = rawJwtSecret || crypto.randomBytes(48).toString("hex");
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 
 const adminLoginLimiter = rateLimit({
@@ -66,7 +66,7 @@ async function requireAdmin(req, res, next) {
       payload = jwt.verify(token, JWT_SECRET);
     }
 
-    if (!payload || !payload.id) {
+    if (!payload || !payload.id || payload.tokenType !== "admin") {
       return res.status(403).json({ error: "Admin access required." });
     }
 
@@ -1147,6 +1147,147 @@ router.post("/firewall/ban", async (req, res) => {
     res.json({ success: true, message: `IP ${ip} has been jailed.`, incidentId });
   } catch (error) {
     res.status(500).json({ error: "Failed to ban IP." });
+  }
+});
+
+router.get("/security-overview", requireAdmin, async (_req, res) => {
+  try {
+    const { getFirewallMetrics } = require("./firewall");
+    const { getSessionTelemetry } = require("./sessionManager");
+    const { getEncryptionStatus } = require("./cryptoAtRest");
+    const { getIceServersConfig } = require("./p2pSocketServer");
+
+    const fw = getFirewallMetrics();
+    const sess = await getSessionTelemetry();
+    const enc = getEncryptionStatus();
+    const dbStatus = getDbStatus();
+    const b2Connected = await testB2Connection().catch(() => false);
+    const iceServers = getIceServersConfig();
+    const auditLogs = await getAuditLogs({ limit: 25 }).catch(() => []);
+
+    const findings = [];
+    if (!process.env.ENCRYPTION_MASTER_KEY) {
+      findings.push({
+        severity: "Medium",
+        layer: "Layer 6",
+        title: "ENCRYPTION_MASTER_KEY derived from JWT_SECRET",
+        detail: "Set a dedicated 64-hex-char ENCRYPTION_MASTER_KEY in backend environment for independent key rotation.",
+      });
+    }
+    if (!process.env.TURN_URL && !process.env.METERED_TURN_USERNAME) {
+      findings.push({
+        severity: "Low",
+        layer: "Layer 4/P2P",
+        title: "No dedicated TURN relay configured",
+        detail: "P2P uses STUN + DTLS/SRTP; strict symmetric NAT mobile networks may require TURN relay credentials.",
+      });
+    }
+    if (!dbStatus.isTiDBConnected) {
+      findings.push({
+        severity: "High",
+        layer: "Layer 7/DB",
+        title: "Local JSON fallback database active",
+        detail: "TiDB Cloud is not connected in this environment; configure TIDB_* variables for production persistence.",
+      });
+    }
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      osiLayers: [
+        {
+          layer: 7,
+          name: "Application Layer",
+          scope: "App-Enforced",
+          status: "Active",
+          controls: [
+            "RBAC (user/admin) & JWT tokenType verification",
+            "Parameterized SQL queries (mysql2) + Zod/express validation",
+            "DeepShield WAF (SQLi, XSS, LFI, RCE, exploit probes)",
+            "Magic-byte & EICAR malware upload scanner",
+            "Rate limiting (login, OTP, access codes, uploads)",
+          ],
+        },
+        {
+          layer: 6,
+          name: "Presentation Layer",
+          scope: "App-Enforced",
+          status: "Active",
+          controls: [
+            `At-rest ${enc.atRestAlgorithm} (${enc.envelopeFormat}, ${enc.nonceSizeBits}-bit IV, ${enc.authTagBits}-bit tag)`,
+            `P2P E2EE (${enc.p2pE2eeAlgorithm})`,
+            "SHA-256 access code hashing & file integrity parity",
+            "URL credential redaction in server logs",
+          ],
+        },
+        {
+          layer: 5,
+          name: "Session Layer",
+          scope: "App-Enforced",
+          status: "Active",
+          controls: [
+            "JWT jti revocation on logout",
+            "Single-use refresh-token rotation with replay detection",
+            "Password-change token_version invalidation",
+            "Authoritative server-side expiry, download limits & Burn-on-Read",
+          ],
+        },
+        {
+          layer: 4,
+          name: "Transport Layer",
+          scope: "Hybrid (App + Host)",
+          status: "Active",
+          controls: [
+            "Helmet CSP, HSTS (max-age=31536000; includeSubDomains; preload)",
+            "Strict CORS allowlist (Vercel, localhost, capacitor://)",
+            "WebRTC DTLS/SRTP + WSS signaling via Render/Vercel TLS",
+          ],
+        },
+        {
+          layer: 3,
+          name: "Network Layer",
+          scope: "Hybrid (App + Provider)",
+          status: "Active",
+          controls: [
+            "IP-based rate limiting & DeepShield adaptive auto-ban jail",
+            "Trust proxy hop configuration",
+            "Cloudflare/Render DDoS & edge firewall (provider-managed)",
+          ],
+        },
+        {
+          layer: 2,
+          name: "Data Link Layer",
+          scope: "Provider-Managed",
+          status: "Provider-Managed",
+          controls: [
+            "Private Backblaze B2 & TiDB Cloud TLS-authenticated endpoints",
+            "Cloud VPC/network isolation managed by Render, Vercel, TiDB, B2",
+          ],
+        },
+        {
+          layer: 1,
+          name: "Physical Layer",
+          scope: "Provider-Managed",
+          status: "Provider-Managed",
+          controls: [
+            "Physical data-center security & disk encryption managed by Render, Vercel, TiDB Cloud, and Backblaze B2",
+          ],
+        },
+      ],
+      firewall: fw,
+      sessions: sess,
+      encryption: enc,
+      infrastructure: {
+        tidbConnected: Boolean(dbStatus.isTiDBConnected),
+        b2Configured: isB2Configured(),
+        b2Connected: Boolean(b2Connected),
+        iceServerCount: Array.isArray(iceServers) ? iceServers.length : 0,
+      },
+      findings,
+      recentAuditLogs: auditLogs,
+    });
+  } catch (err) {
+    console.error("[Admin Security Overview Error]", err.message);
+    res.status(500).json({ error: "Failed to load security overview." });
   }
 });
 
